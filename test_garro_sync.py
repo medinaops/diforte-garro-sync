@@ -146,12 +146,14 @@ def correr_main(cursores, cfg=None, leer=None):
 
 
 class ParidadMigracion(unittest.TestCase):
-    """TABLAS tiene que coincidir con la migración 329 (tablas, columnas, tipos, PK, GRANT)."""
+    """TABLAS tiene que coincidir con las migraciones 329 + 350 (tablas, columnas, tipos, PK, GRANT)."""
 
     @classmethod
     def setUpClass(cls):
-        with open(migracion(329), encoding="utf-8") as f:
-            cls.sql = f.read()
+        cls.sql = ""
+        for numero in (329, 350):
+            with open(migracion(numero), encoding="utf-8") as f:
+                cls.sql += f.read() + "\n"
 
     def test_tablas_columnas_tipos_y_pk(self):
         migracion = {}
@@ -172,9 +174,9 @@ class ParidadMigracion(unittest.TestCase):
             self.assertEqual(script[nombre], migracion[nombre], nombre)
 
     def test_grant_cubre_todas_las_tablas(self):
-        m = re.search(r"GRANT TRUNCATE, INSERT ON (.*?) TO garro_sync;", self.sql, re.S)
-        self.assertIsNotNone(m)
-        otorgadas = [t.strip().replace("garro.", "") for t in m.group(1).split(",")]
+        grants = re.findall(r"GRANT TRUNCATE, INSERT ON (.*?) TO garro_sync;", self.sql, re.S)
+        self.assertTrue(grants)
+        otorgadas = [t.strip().replace("garro.", "") for m in grants for t in m.split(",")]
         self.assertEqual(sorted(otorgadas), sorted(n for n, _, _ in g.TABLAS))
 
 
@@ -400,6 +402,18 @@ class TraductorDeErrores(unittest.TestCase):
         for exc, etapa, esperado in casos:
             self.assertIn(esperado, g.traducir_error(exc, etapa), repr(exc))
 
+    def test_rechazos_del_servidor_ya_decodificados(self):
+        casos = [
+            ('FATAL:  no hay una línea en pg_hba.conf para «203.0.113.7», usuario «u», base de datos «b», sin cifrado',
+             "pg_hba.conf"),
+            ('FATAL:  la autentificación password falló para el usuario «u»', "-Reconfigurar"),
+            ('FATAL:  no existe la base de datos «b»', "GARRO_BASE"),
+        ]
+        for texto, esperado in casos:
+            msg = g.traducir_error(Exception(texto), "origen")
+            self.assertIn(esperado, msg, texto)
+            self.assertNotIn("GARRO_ENCODING", msg)
+
     def test_config_faltante(self):
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaises(g.ErrorSync) as ctx:
@@ -411,6 +425,70 @@ class TraductorDeErrores(unittest.TestCase):
             with self.assertRaises(g.ErrorSync) as ctx:
                 g.validar_origen(g.leer_archivo(ruta))
             self.assertIn("GARRO_PUERTO", str(ctx.exception))
+
+
+def error_de_conexion(mensaje, codec="latin-1"):
+    crudo = mensaje.encode(codec)
+    return UnicodeDecodeError("utf-8", crudo, 79, 80, "invalid continuation byte")
+
+
+class ConexionOrigenRechazada(unittest.TestCase):
+    def conectar(self, error):
+        falso = mock.MagicMock()
+        falso.connect.side_effect = error
+        with mock.patch.dict(sys.modules, {"psycopg2": falso}):
+            return g.conectar_origen(dict(CFG))
+
+    def test_pg_hba_en_espanol_latin1(self):
+        texto = ('FATAL:  no hay una línea en pg_hba.conf para «203.0.113.7», usuario «u», '
+                 'base de datos «b», sin cifrado')
+        with self.assertRaises(g.ErrorSync) as ctx:
+            self.conectar(error_de_conexion(texto))
+        msg = str(ctx.exception)
+        self.assertIn("pg_hba.conf", msg)
+        self.assertIn("administrador del servidor", msg)
+        self.assertIn("línea", msg)
+        self.assertIn("203.0.113.7", msg)  # el texto del servidor viaja para ver qué pide
+        self.assertNotIn("GARRO_ENCODING", msg)
+
+    def test_pg_hba_en_ingles(self):
+        texto = 'FATAL:  no pg_hba.conf entry for host "203.0.113.7", user "u", database "b", no encryption'
+        with self.assertRaises(g.ErrorSync) as ctx:
+            self.conectar(error_de_conexion(texto))
+        self.assertIn("administrador del servidor", str(ctx.exception))
+
+    def test_contrasena_rechazada_cp1252(self):
+        texto = 'FATAL:  la autentificación password falló para el usuario «u»'
+        with self.assertRaises(g.ErrorSync) as ctx:
+            self.conectar(error_de_conexion(texto, "cp1252"))
+        msg = str(ctx.exception)
+        self.assertIn("-Reconfigurar", msg)
+        self.assertNotIn("GARRO_ENCODING", msg)
+
+    def test_contrasena_rechazada_en_ingles(self):
+        with self.assertRaises(g.ErrorSync) as ctx:
+            self.conectar(error_de_conexion('FATAL:  password authentication failed for user "u"'))
+        self.assertIn("-Reconfigurar", str(ctx.exception))
+
+    def test_base_inexistente(self):
+        for texto in ('FATAL:  no existe la base de datos «b»', 'FATAL:  database "b" does not exist'):
+            with self.assertRaises(g.ErrorSync) as ctx:
+                self.conectar(error_de_conexion(texto))
+            self.assertIn("GARRO_BASE", str(ctx.exception))
+
+    def test_otro_muestra_el_texto_del_servidor(self):
+        with self.assertRaises(g.ErrorSync) as ctx:
+            self.conectar(error_de_conexion("FATAL:  el sistema está arrancando"))
+        self.assertIn("el sistema está arrancando", str(ctx.exception))
+
+    def test_decode_error_de_conexion_sin_traducir_no_pide_encoding(self):
+        msg = g.traducir_error(error_de_conexion("FATAL:  algo raro de la conexión"), "origen")
+        self.assertNotIn("GARRO_ENCODING", msg)
+
+    def test_decode_error_de_datos_sigue_pidiendo_encoding(self):
+        e = UnicodeDecodeError("utf-8", b"Nota D\xe9bito", 6, 7, "invalid continuation byte")
+        self.assertIn("GARRO_ENCODING=WIN1252", g.traducir_error(e, "origen"))
+        self.assertIn("GARRO_ENCODING=WIN1252", g.traducir_error(Exception("invalid byte sequence for encoding"), "origen"))
 
 
 class ParidadMigracion349(unittest.TestCase):
@@ -495,6 +573,24 @@ class GuardiaDeFoto(unittest.TestCase):
         nuevas["listas_precios"] = 0  # no es obligatoria
         g.validar_foto(nuevas, None, False)
         g.validar_foto(nuevas, {}, False)
+
+    def test_tablas_de_cotizaciones_no_son_clave(self):
+        nuevas = filas_falsas()
+        for t in ("presupuestos", "presupuestos_x_clientes", "items_presupuesto",
+                  "productos_x_items_presupuestos", "conceptos_presupuestos", "conceptos_x_items_presupuesto"):
+            self.assertIn(t, nuevas)
+            self.assertNotIn(t, g.OBLIGATORIAS)
+            nuevas[t] = 0
+        g.validar_foto(nuevas, None, False)
+
+    def test_tabla_nueva_sin_conteo_previo_no_se_compara(self):
+        previas = {n: 100 for n in filas_falsas() if not n.startswith(("presupuestos", "items_presupuesto"))}
+        nuevas = filas_falsas()
+        nuevas["presupuestos"] = 0
+        nuevas["items_presupuesto"] = 50
+        g.validar_foto(nuevas, previas, False)
+        previas["presupuestos"] = 0
+        g.validar_foto(nuevas, previas, False)
 
     def test_tabla_que_pasa_a_cero_aborta(self):
         nuevas = filas_falsas()

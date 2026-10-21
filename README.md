@@ -1,6 +1,6 @@
 # garro-sync: copia de Gestión Integral a Supabase
 
-Copia los comprobantes de venta y compra, clientes, proveedores, productos y catálogos de **Gestión Integral** (Garro Sistemas) a una base de Supabase, para el módulo de costos de Diforte. Corre en una PC de oficina de Windows. Este repo es público a propósito: no lleva contraseñas, IPs ni datos internos (esos se piden al instalar y quedan solo en esa PC).
+Copia los comprobantes de venta y compra, las cotizaciones, clientes, proveedores, productos y catálogos de **Gestión Integral** (Garro Sistemas) a una base de Supabase, para el módulo de costos de Diforte. Corre en una PC de oficina de Windows. Este repo es público a propósito: no lleva contraseñas, IPs ni datos internos (esos se piden al instalar y quedan solo en esa PC).
 
 - Lee Gestión Integral con un usuario de **solo lectura** y la sesión abierta en modo solo lectura.
 - Escribe en Supabase con un rol que solo puede vaciar e insertar en su schema, por conexión verificada (`sslmode=verify-full` con la CA de Supabase que viaja en este repo, y SCRAM obligatorio).
@@ -74,7 +74,7 @@ Antes de vaciar el espejo se valida lo leído. Si algo no cierra, **no se public
   ```
 
 - Acentos mal en `--prueba`: agregar `GARRO_ENCODING=WIN1252` (o `UTF8`) en `.env.garro-sync`.
-- Contraseña rechazada: correr el instalador con `-Reconfigurar`.
+- Si el servidor de Garro rechaza la conexión, el programa muestra el motivo real: la PC no está habilitada en el servidor, usuario o contraseña incorrectos (correr el instalador con `-Reconfigurar`) o base inexistente (revisar `GARRO_BASE`).
 - Verificar que la tarea de pedidos quedó con repetición cada 5 minutos:
 
   ```powershell

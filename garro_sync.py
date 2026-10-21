@@ -26,7 +26,7 @@ Uso:
     python garro_sync.py --si-hay-pedido  # copia solo si alguien pidió «Actualizar ahora» (tarea de cada 5 min)
     python garro_sync.py --prueba-destino # prueba la conexión segura y la contraseña de Supabase; no escribe nada
     python garro_sync.py --forzar      # copia saltando la guardia de la foto (solo uso manual)
-    python garro_sync.py --ddl         # imprime el SQL de las tablas espejo (mig 329)
+    python garro_sync.py --ddl         # imprime el SQL de las tablas espejo (mig 329 + 350)
 
 Configuración: archivo `.env.garro-sync` al lado de este script (ver README.md).
 """
@@ -50,7 +50,10 @@ from datetime import datetime, timezone
 # De clientes y proveedores se copian identificación fiscal, razón social, nombre de fantasía,
 # condición de IVA y condiciones comerciales (lista de precios, tipo de cliente, condición de
 # venta, descuento, estado, cuenta de imputación); NO se copian teléfonos, mails ni domicilios.
-# Esta lista es la fuente de verdad de la migración 329 (`--ddl`): si se cambia,
+# De las cotizaciones (`presupuestos` en Garro, distintas del comprobante de venta tipo «Presupuesto»)
+# se copian cabecera, cliente, ítems, producto y concepto de cada ítem; NO se copian el operario
+# ni los recordatorios.
+# Esta lista es la fuente de verdad de las migraciones 329 + 350 (`--ddl`): si se cambia,
 # va una migración nueva con el mismo cambio.
 TABLAS: list[tuple[str, str, list[tuple[str, str]]]] = [
     ("tipos_comprobantes_ventas", "id_tipo_comprobante_venta", [
@@ -178,6 +181,36 @@ TABLAS: list[tuple[str, str, list[tuple[str, str]]]] = [
         ("id_producto_unidad_de_medida", "integer"), ("cod_producto_unidad_de_medida", "text"),
         ("des_producto_unidad_de_medida", "text"),
     ]),
+    ("presupuestos", "id_presupuesto", [
+        ("id_presupuesto", "integer"), ("fec_presupuesto", "date"), ("fec_vig_presupuesto", "date"),
+        ("obs_presupuesto", "text"), ("nota_presupuesto", "text"), ("cliente_presupuesto", "text"),
+        ("porc_desc_presupuesto", "double precision"), ("sumarizar_presupuesto", "boolean"),
+        ("fk_id_moneda", "integer"), ("stock", "boolean"), ("estado_presupuesto", "text"),
+        ("fec_cambio_estado_presupuesto", "timestamp"),
+    ]),
+    ("presupuestos_x_clientes", "id_presupuesto_x_cliente", [
+        ("id_presupuesto_x_cliente", "integer"), ("fk_id_cliente", "integer"),
+        ("fk_id_presupuesto", "integer"),
+    ]),
+    ("items_presupuesto", "id_item_presupuesto", [
+        ("id_item_presupuesto", "integer"), ("fk_id_presupuesto", "integer"),
+        ("can_item_presupuesto", "double precision"),
+        ("imp_neto_item_presupuesto", "double precision"),
+        ("porc_iva_item_presupuesto", "double precision"),
+        ("porc_desc_item_presupuesto", "double precision"),
+        ("imp_int_item_presupuesto", "double precision"),
+    ]),
+    ("productos_x_items_presupuestos", "id_producto_x_item_presupuesto", [
+        ("id_producto_x_item_presupuesto", "integer"), ("fk_id_producto", "integer"),
+        ("fk_id_item_presupuesto", "integer"),
+    ]),
+    ("conceptos_presupuestos", "id_concepto_presupuesto", [
+        ("id_concepto_presupuesto", "integer"), ("des_concepto_presupuesto", "text"),
+    ]),
+    ("conceptos_x_items_presupuesto", "id_concepto_x_item_presupuesto", [
+        ("id_concepto_x_item_presupuesto", "integer"), ("fk_id_concepto_presupuesto", "integer"),
+        ("fk_id_item_presupuesto", "integer"),
+    ]),
 ]
 
 ARCHIVO_CONFIG = ".env.garro-sync"
@@ -280,7 +313,7 @@ def decir(texto: str = "") -> None:
 
 
 def ddl() -> str:
-    """SQL de las tablas espejo, para la migración 329."""
+    """SQL de las tablas espejo (migraciones 329 + 350)."""
     partes = []
     for nombre, pk, columnas in TABLAS:
         cols = ",\n  ".join(f"{c} {t}" + (" PRIMARY KEY" if c == pk else "") for c, t in columnas)
@@ -289,6 +322,46 @@ def ddl() -> str:
 
 
 # ---------------------------------------------------------------- errores
+
+def _es_pg_hba(bajo: str) -> bool:
+    return "pg_hba.conf" in bajo and ("no hay una l" in bajo or "no pg_hba.conf entry" in bajo)
+
+
+def _es_clave_rechazada(bajo: str) -> bool:
+    return "password authentication failed" in bajo or ("autentificaci" in bajo and "password fall" in bajo)
+
+
+def _es_base_inexistente(bajo: str) -> bool:
+    return "no existe la base de datos" in bajo or ("database" in bajo and "does not exist" in bajo)
+
+
+def mensaje_rechazo_origen(texto: str) -> str:
+    """Mensaje claro cuando el servidor de Garro rechaza la conexión (el texto del servidor viaja tal cual)."""
+    texto = " ".join(texto.split())
+    bajo = texto.lower()
+    if _es_pg_hba(bajo):
+        return ("El servidor de Garro no tiene habilitada esta PC para ese usuario y esa base. Hay que pedirle "
+                "al administrador del servidor que agregue la línea correspondiente en pg_hba.conf y recargue "
+                f"la configuración. Lo que informa el servidor: {texto}")
+    if _es_clave_rechazada(bajo):
+        return ("Gestión Integral (Garro) rechazó el usuario o la contraseña. Corré el instalador con "
+                "-Reconfigurar para cargarlos de nuevo.")
+    if _es_base_inexistente(bajo):
+        return ("El servidor de Garro dice que esa base de datos no existe. Revisá GARRO_BASE en "
+                f".env.garro-sync. Lo que informa el servidor: {texto}")
+    return f"El servidor de Garro rechazó la conexión. Lo que informa el servidor: {texto}"
+
+
+def decodificar_error_conexion(e: UnicodeDecodeError) -> str:
+    """El servidor puede responder con un mensaje no UTF-8 (Latin-1/Windows): lo recupera de e.object."""
+    crudo = e.object if isinstance(e.object, (bytes, bytearray)) else b""
+    for codec in ("utf-8", "cp1252", "latin-1"):
+        try:
+            return bytes(crudo).decode(codec)
+        except UnicodeDecodeError:
+            continue
+    return bytes(crudo).decode("latin-1", errors="replace")
+
 
 def traducir_error(exc: BaseException, etapa: str) -> str:
     """Convierte un error técnico en un mensaje en español para quien opera la copia."""
@@ -301,6 +374,12 @@ def traducir_error(exc: BaseException, etapa: str) -> str:
     bajo = texto.lower()
     pgcode = getattr(exc, "pgcode", None)
 
+    if isinstance(exc, UnicodeDecodeError):
+        # Un rechazo del servidor al CONECTAR (mensaje en Latin-1) no es un problema de datos.
+        real = decodificar_error_conexion(exc)
+        if etapa == "origen" and (_es_pg_hba(real.lower()) or _es_clave_rechazada(real.lower())
+                                  or _es_base_inexistente(real.lower()) or real.startswith(("FATAL", "fatal"))):
+            return mensaje_rechazo_origen(real)
     if isinstance(exc, (UnicodeDecodeError, UnicodeEncodeError)) or "invalid byte sequence" in bajo \
             or "client_encoding" in bajo or "unknown encoding" in bajo or "codec can't" in bajo:
         return ("Hay caracteres (acentos, eñes) que no se pueden leer con la codificación actual. "
@@ -316,7 +395,10 @@ def traducir_error(exc: BaseException, etapa: str) -> str:
     if "authentication method requirement" in bajo or "require_auth" in bajo:
         return ("Supabase no ofreció el método de autenticación seguro esperado (scram-sha-256). "
                 "No se envió la contraseña. Avisá a Alexander.")
+    if etapa == "origen" and (_es_pg_hba(bajo) or _es_clave_rechazada(bajo) or _es_base_inexistente(bajo)):
+        return mensaje_rechazo_origen(texto)
     if "password authentication failed" in bajo or "authentication failed" in bajo \
+            or "autentificaci" in bajo and "password fall" in bajo \
             or "tenant or user not found" in bajo or "no pg_hba.conf entry" in bajo:
         if etapa == "origen":
             return ("Gestión Integral (Garro) rechazó el usuario o la contraseña. Revisá GARRO_USUARIO y "
@@ -446,11 +528,15 @@ def validar_origen(cfg: dict[str, str]) -> None:
 def conectar_origen(cfg: dict[str, str]):
     import psycopg2
     validar_origen(cfg)
-    con = psycopg2.connect(
-        host=cfg["GARRO_HOST"], port=int(cfg["GARRO_PUERTO"]), dbname=cfg["GARRO_BASE"],
-        user=cfg["GARRO_USUARIO"], password=cfg["GARRO_PASSWORD"],
-        connect_timeout=20, application_name="garro_sync (lectura)",
-    )
+    try:
+        con = psycopg2.connect(
+            host=cfg["GARRO_HOST"], port=int(cfg["GARRO_PUERTO"]), dbname=cfg["GARRO_BASE"],
+            user=cfg["GARRO_USUARIO"], password=cfg["GARRO_PASSWORD"],
+            connect_timeout=20, application_name="garro_sync (lectura)",
+        )
+    except UnicodeDecodeError as e:
+        # El servidor rechazó la conexión con un mensaje en Latin-1 que psycopg2 no sabe leer como UTF-8.
+        raise ErrorSync(mensaje_rechazo_origen(decodificar_error_conexion(e))) from e
     # Doble seguro: aunque el usuario tuviera permisos de más, esta sesión no puede escribir.
     con.set_session(readonly=True, autocommit=False)
     # Los acentos: una base vieja suele estar en SQL_ASCII con texto de Windows adentro, y
