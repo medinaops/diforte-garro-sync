@@ -1,0 +1,6 @@
+.env*
+*.log
+python/
+__pycache__/
+.pytest_cache/
+version.txt
