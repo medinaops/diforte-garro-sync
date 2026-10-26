@@ -14,7 +14,7 @@ import re
 import sys
 
 AQUI = os.path.dirname(os.path.abspath(__file__))
-ARCHIVOS = ["actualizar-ahora.bat", "garro_sync.py", "requirements.txt", "supabase-ca-2021.crt"]
+ARCHIVOS = ["actualizar-ahora.bat", "garro_sync.py", "relevar_compras.py", "requirements.txt", "supabase-ca-2021.crt"]
 INSTALADOR = os.path.join(AQUI, "install.ps1")
 PATRON = re.compile(r"(# BEGIN HASHES\r?\n).*?(# END HASHES)", re.S)
 

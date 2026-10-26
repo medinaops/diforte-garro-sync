@@ -51,6 +51,18 @@ $i = [scriptblock]::Create((irm https://raw.githubusercontent.com/medinaops/difo
 - **En la PC:** doble clic en **Actualizar Garro ahora** (escritorio). Corre la copia, muestra el resultado y espera una tecla.
 - **Desde el sistema** de Diforte (Costos > Gastos > «Actualizar ahora», solo administración): la PC lo toma en menos de 5 minutos. Si estaba apagada, el pedido espera hasta 24 horas. Si la copia falla, el pedido se reintenta solo cada 5 minutos, hasta 3 intentos (si lo rechaza la guardia, no se reintenta): después queda como fallido y se puede pedir otro. Una copia diaria o manual también atiende el pedido pendiente.
 
+## Relevamiento de compras (solo lectura)
+
+`relevar_compras.py` registra qué filas escribe Gestión Integral cuando se guarda un comprobante de compra. Usa la misma conexión de solo lectura que la copia. Lo que genera queda en la carpeta `relevamiento\` de la PC y no se sube a ningún lado. Contraseñas, tokens e imágenes nunca salen de la base.
+
+```powershell
+cd "$env:LOCALAPPDATA\Diforte\garro-sync"
+.\python\python.exe relevar_compras.py catalogo   # una vez: estructura de la base y comprobantes de muestra
+.\python\python.exe relevar_compras.py foto       # justo antes de cargar un comprobante
+# ...se carga UN comprobante en Gestión Integral, como siempre...
+.\python\python.exe relevar_compras.py comparar   # justo después: lista las tablas que cambiaron
+```
+
 ## Guardia
 
 Antes de vaciar el espejo se valida lo leído. Si algo no cierra, **no se publica nada y sigue la copia anterior**; el motivo queda registrado y se ve en el sistema.
