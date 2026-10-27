@@ -556,8 +556,16 @@ class IntegridadDelPaquete(unittest.TestCase):
         # Los cmdlets CDXML de ScheduledTasks ignoran $ErrorActionPreference: sin este default, un fallo al
         # registrar la tarea S4U dejaba al instalador preguntando 10 minutos por una tarea inexistente.
         texto = open(os.path.join(AQUI, "install.ps1"), encoding="ascii", newline="").read()
-        self.assertIn('$PSDefaultParameterValues = @{ "*-ScheduledTask*:ErrorAction" = "Stop" }', texto)
-        self.assertLess(texto.index("$PSDefaultParameterValues"), texto.index("function Pausar-Tareas"))
+        activo = "\n".join(l for l in texto.splitlines() if not l.lstrip().startswith("#"))
+        self.assertIn('$defaultsLocales["*-ScheduledTask*:ErrorAction"] = "Stop"', activo)
+        self.assertIn("$PSDefaultParameterValues = $defaultsLocales", activo)
+        self.assertLess(activo.index("$PSDefaultParameterValues = $defaultsLocales"), activo.index("function Pausar-Tareas"))
+
+    def test_usuario_sugerido_es_el_de_solo_lectura(self):
+        # Repo publico: el instalador nunca sugiere el superusuario de la base.
+        texto = open(os.path.join(AQUI, "install.ps1"), encoding="ascii", newline="").read()
+        self.assertIn('else { "garro_lectura" }) $null', texto)
+        self.assertNotIn('else { "postgres" }', texto)
 
     def test_install_ps1_sin_variables_seguidas_de_dos_puntos(self):
         # "$usuario:" dentro de comillas es un error de parseo en PowerShell (lo toma como unidad/ambito):
