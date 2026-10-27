@@ -35,5 +35,14 @@ Chequear ($resultado -contains "corto" -and $resultado -notcontains "siguio") "u
 Chequear ($resultado -contains "heredado") "los defaults de la sesion se conservan dentro del instalador"
 Chequear (-not $PSDefaultParameterValues.ContainsKey("*-ScheduledTask*:ErrorAction")) "la sesion no queda modificada"
 
+# Control: sin ese default, el mismo error NO corta (es el bucle de v1.3.3). Si esto cambia, la prueba de arriba
+# dejaria de demostrar algo.
+$sinDefault = & {
+    $ErrorActionPreference = "Stop"
+    function Consultar { Get-ScheduledTaskInfo -TaskName "diforte-no-existe-$(Get-Random)" 2>$null | Out-Null; "siguio" }
+    try { Consultar } catch { "corto" }
+}
+Chequear ($sinDefault -contains "siguio") "control: sin el default, el error de ScheduledTasks no corta ($($sinDefault -join ','))"
+
 if ($fallas -gt 0) { Write-Host "$fallas fallas"; exit 1 }
 Write-Host "0 fallas"
