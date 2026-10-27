@@ -1,5 +1,8 @@
 # Pruebas del instalador en Windows PowerShell 5.1 (GitHub Actions, windows-latest). No instala nada.
-$ErrorActionPreference = "Stop"
+# GitHub Actions corre "shell: powershell" con $ErrorActionPreference = 'stop' GLOBAL. Una consola normal (como la
+# del servidor) arranca en Continue, y los cmdlets CDXML de ScheduledTasks (funciones de modulo) leen la preferencia
+# global, no la del scriptblock del instalador. Se reproduce la consola normal.
+$global:ErrorActionPreference = "Continue"
 $fallas = 0
 function Chequear($ok, $texto) {
     if ($ok) { Write-Host "OK    $texto" } else { Write-Host "FALLA $texto"; $script:fallas++ }
@@ -40,6 +43,7 @@ Chequear (-not $PSDefaultParameterValues.ContainsKey("*-ScheduledTask*:ErrorActi
 $sinDefault = & {
     $ErrorActionPreference = "Stop"
     function Consultar { Get-ScheduledTaskInfo -TaskName "diforte-no-existe-$(Get-Random)" 2>$null | Out-Null; "siguio" }
+    # (2>$null solo para no ensuciar el log: sin -ErrorAction Stop el error no es terminante y sigue)
     try { Consultar } catch { "corto" }
 }
 Chequear ($sinDefault -contains "siguio") "control: sin el default, el error de ScheduledTasks no corta ($($sinDefault -join ','))"
