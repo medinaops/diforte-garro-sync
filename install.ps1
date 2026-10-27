@@ -33,11 +33,15 @@ $tlsAnterior = [Net.ServicePointManager]::SecurityProtocol
 try {
 & {
 $ErrorActionPreference = "Stop"
+# Los cmdlets de ScheduledTasks (CDXML) NO respetan $ErrorActionPreference del script: sin esto un fallo
+# (por ejemplo, Windows no deja crear una tarea S4U) se muestra en rojo y el script sigue como si nada.
+# Las llamadas con -ErrorAction explicito (SilentlyContinue) mantienen el suyo.
+$PSDefaultParameterValues = @{ "*-ScheduledTask*:ErrorAction" = "Stop" }
 $ProgressPreference = "SilentlyContinue"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # ---------------------------------------------------------------- constantes
-$Version         = "v1.3.3"
+$Version         = "v1.3.4"
 $Repo            = "medinaops/diforte-garro-sync"
 # Por usuario: en C:\ cualquier usuario puede crear carpetas y plantar un python.exe; en LOCALAPPDATA no.
 $Dir             = Join-Path $env:LOCALAPPDATA "Diforte\garro-sync"
@@ -344,7 +348,7 @@ if ($Reconfigurar -or -not (Test-Path $Config)) {
     $cfg["GARRO_HOST"]   = Preguntar "GARRO_HOST" $sugerido "En el servidor de Garro: 127.0.0.1. En otra PC: la IP de Radmin del servidor."
     $cfg["GARRO_PUERTO"] = Preguntar "GARRO_PUERTO" $(if ($act["GARRO_PUERTO"]) { $act["GARRO_PUERTO"] } else { "5432" }) $null
     $cfg["GARRO_BASE"]   = Preguntar "GARRO_BASE" $(if ($act["GARRO_BASE"]) { $act["GARRO_BASE"] } else { "GestionIntegral" }) $null
-    $cfg["GARRO_USUARIO"] = Preguntar "GARRO_USUARIO" $(if ($act["GARRO_USUARIO"]) { $act["GARRO_USUARIO"] } else { "garro_lectura" }) $null
+    $cfg["GARRO_USUARIO"] = Preguntar "GARRO_USUARIO" $(if ($act["GARRO_USUARIO"]) { $act["GARRO_USUARIO"] } else { "postgres" }) $null
     $cfg["GARRO_PASSWORD"] = Preguntar-Secreto "Contrasena de GARRO_USUARIO (no se muestra)" $act["GARRO_PASSWORD"]
     $cfg["SUPABASE_HOST"]    = $SupabaseHost
     $cfg["SUPABASE_PUERTO"]  = $SupabasePuerto

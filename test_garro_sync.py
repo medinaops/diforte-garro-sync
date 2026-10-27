@@ -552,6 +552,13 @@ class IntegridadDelPaquete(unittest.TestCase):
         activas = [l for l in texto.decode("ascii").splitlines() if not l.lstrip().startswith("#")]
         self.assertFalse(any("TimeSpan]::MaxValue" in l for l in activas))  # rompe Register-ScheduledTask en Win10/11
 
+    def test_cmdlets_de_tareas_cortan_ante_un_error(self):
+        # Los cmdlets CDXML de ScheduledTasks ignoran $ErrorActionPreference: sin este default, un fallo al
+        # registrar la tarea S4U dejaba al instalador preguntando 10 minutos por una tarea inexistente.
+        texto = open(os.path.join(AQUI, "install.ps1"), encoding="ascii", newline="").read()
+        self.assertIn('$PSDefaultParameterValues = @{ "*-ScheduledTask*:ErrorAction" = "Stop" }', texto)
+        self.assertLess(texto.index("$PSDefaultParameterValues"), texto.index("function Pausar-Tareas"))
+
     def test_install_ps1_sin_variables_seguidas_de_dos_puntos(self):
         # "$usuario:" dentro de comillas es un error de parseo en PowerShell (lo toma como unidad/ambito):
         # todo el script falla antes de correr. Se escribe "${usuario}:".
