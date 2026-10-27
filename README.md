@@ -1,6 +1,6 @@
 # garro-sync: copia de Gestión Integral a Supabase
 
-Copia los comprobantes de venta y compra, las cotizaciones, clientes, proveedores, productos y catálogos de **Gestión Integral** (Garro Sistemas) a una base de Supabase, para el módulo de costos de Diforte. Corre en una PC de oficina de Windows. Este repo es público a propósito: no lleva contraseñas, IPs ni datos internos (esos se piden al instalar y quedan solo en esa PC).
+Copia los comprobantes de venta y compra, las cotizaciones, clientes, proveedores, productos y catálogos de **Gestión Integral** (Garro Sistemas) a una base de Supabase, para el módulo de costos de Diforte. Corre en el servidor de Garro o en una PC de oficina de Windows. Este repo es público a propósito: no lleva contraseñas, IPs ni datos internos (esos se piden al instalar y quedan solo en esa PC).
 
 - Lee Gestión Integral con un usuario de **solo lectura** y la sesión abierta en modo solo lectura.
 - Escribe en Supabase con un rol que solo puede vaciar e insertar en su schema, por conexión verificada (`sslmode=verify-full` con la CA de Supabase que viaja en este repo, y SCRAM obligatorio).
@@ -9,8 +9,9 @@ Copia los comprobantes de venta y compra, las cotizaciones, clientes, proveedore
 
 ## Requisitos
 
-- Windows 10 u 11, con **PowerShell 5.1** (el que trae Windows). No hace falta ser administrador.
-- La PC tiene que llegar al servidor de Garro (VPN) y a internet, y estar prendida con la sesión iniciada para que corran las tareas.
+- Windows 10/11 o Windows Server 2012 R2 o posterior, con **PowerShell 5.1** (lo trae Windows 10/11 y Server 2016+; en 2012 R2 se instala con Windows Management Framework 5.1). En una PC no hace falta ser administrador; en el servidor puede hacer falta (ver abajo).
+- **En el servidor de Garro (recomendado):** salida a internet. Con `-Servidor`, las tareas corren aunque nadie haya iniciado sesión.
+- **En una PC de oficina:** tiene que llegar al servidor de Garro (VPN) y a internet, y estar prendida con la sesión iniciada para que corran las tareas.
 - Tener a mano: la IP del servidor de Garro, la contraseña del usuario de solo lectura y la contraseña del rol de Supabase.
 
 ## Instalación (un solo comando)
@@ -44,7 +45,27 @@ $i = [scriptblock]::Create((irm https://raw.githubusercontent.com/medinaops/difo
 & $i -Reconfigurar        # vuelve a preguntar la configuración (Enter deja el valor actual)
 & $i -Hora "02:00"        # cambia la hora de la copia diaria
 & $i -Desinstalar         # borra las tareas y el acceso directo; pregunta si borrar la carpeta
+& $i -Servidor            # modo servidor: las tareas corren sin sesión iniciada
+& $i -Interactivo         # vuelve al modo PC de oficina (tareas con la sesión iniciada)
 ```
+
+### Instalar en el servidor de Garro
+
+Así la copia no depende de que una PC de oficina esté prendida.
+
+1. Entrar al servidor por escritorio remoto, con el usuario que va a quedar a cargo de las tareas.
+2. Abrir PowerShell y correr:
+   ```powershell
+   $i = [scriptblock]::Create((irm https://raw.githubusercontent.com/medinaops/diforte-garro-sync/main/install.ps1))
+   & $i -Servidor
+   ```
+3. En `GARRO_HOST` poner `127.0.0.1`: la base está en el mismo servidor y no hace falta VPN. PostgreSQL tiene que aceptar conexiones locales (`pg_hba.conf`); casi siempre viene así.
+4. Las tareas quedan en modo S4U («ejecutar tanto si el usuario inició sesión como si no»), sin guardar ninguna contraseña de Windows. Eso usa el derecho **«Iniciar sesión como proceso por lotes»** del usuario (los administradores lo tienen por defecto). Si Windows no deja crearlas así, el instalador lo dice: hay que abrir PowerShell con «Ejecutar como administrador», con el mismo usuario, y repetir.
+5. **Antes de crear las tareas**, el instalador corre una **prueba real como tarea sin sesión** (lee Garro y prueba Supabase, sin escribir nada). Si falla, frena con el motivo y las tareas que hubiera de antes quedan como estaban. Si el programa llegó a correr, el detalle queda en `garro_sync.log`; si Windows no dejó ni arrancar la tarea, el motivo es el que muestra el instalador. Si algo falla al crear o verificar las tareas reales, el instalador restaura las que había antes.
+6. Las actualizaciones siguientes se hacen con el comando común (`irm … | iex`): si alguna de las tareas ya estaba en modo servidor, lo conservan. Para volver al modo PC de oficina: `& $i -Interactivo`.
+7. Cuando el servidor ya copia bien, en la PC de oficina: `& $i -Desinstalar`, para que no queden dos equipos copiando (un candado impide que se pisen, pero es ruido).
+
+El relevamiento (`relevar_compras.py`) se corre igual, desde la carpeta de instalación en el servidor.
 
 ## Pedir una actualización
 

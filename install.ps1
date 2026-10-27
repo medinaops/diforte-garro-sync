@@ -8,6 +8,14 @@
 #     & $i -Reconfigurar      # vuelve a preguntar la configuracion
 #     & $i -Hora "02:00"      # cambia la hora de la copia diaria
 #     & $i -Desinstalar       # borra tareas y acceso directo
+#     & $i -Servidor          # en el servidor de Garro: las tareas corren sin sesion iniciada
+#     & $i -Interactivo       # vuelve al modo PC de oficina (tareas con la sesion iniciada)
+#
+# Modo servidor (-Servidor): las tareas usan S4U ("ejecutar tanto si el usuario inicio sesion como si no",
+# sin guardar ninguna contrasena de Windows). Si las tareas ya estaban en S4U, una actualizacion comun
+# (irm | iex) conserva el modo. Antes de terminar corre una prueba real como tarea S4U (lee Garro y prueba
+# Supabase, sin escribir nada). Requiere el derecho "Iniciar sesion como proceso por lotes"; puede pedir
+# abrir PowerShell como administrador.
 #
 # No pide permisos de administrador. Correrlo de nuevo = actualizar (conserva .env.garro-sync y los logs).
 # Todo corre en su propio scope: no deja variables (ni contrasenas) en la sesion de PowerShell.
@@ -16,6 +24,8 @@
 param(
     [switch]$Reconfigurar,
     [switch]$Desinstalar,
+    [switch]$Servidor,
+    [switch]$Interactivo,
     [string]$Hora = "13:00"
 )
 
@@ -27,7 +37,7 @@ $ProgressPreference = "SilentlyContinue"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # ---------------------------------------------------------------- constantes
-$Version         = "v1.3.1"
+$Version         = "v1.3.2"
 $Repo            = "medinaops/diforte-garro-sync"
 # Por usuario: en C:\ cualquier usuario puede crear carpetas y plantar un python.exe; en LOCALAPPDATA no.
 $Dir             = Join-Path $env:LOCALAPPDATA "Diforte\garro-sync"
@@ -127,8 +137,13 @@ function Pausar-Tareas {
 }
 function Reanudar-Tareas {
     foreach ($t in $tareasPausadas) {
-        if (Get-ScheduledTask -TaskName $t -ErrorAction SilentlyContinue) {
-            Enable-ScheduledTask -TaskName $t -ErrorAction SilentlyContinue | Out-Null
+        try {
+            if (Get-ScheduledTask -TaskName $t -ErrorAction SilentlyContinue) {
+                Enable-ScheduledTask -TaskName $t -ErrorAction Stop | Out-Null
+                if ("$((Get-ScheduledTask -TaskName $t -ErrorAction Stop).State)" -eq "Disabled") { throw "sigue deshabilitada" }
+            }
+        } catch {
+            Write-Host "  ! No se pudo volver a habilitar la tarea '$t' ($($_.Exception.Message)): habilitarla a mano en el Programador de tareas y avisar a Alexander." -ForegroundColor Red
         }
     }
 }
@@ -162,7 +177,7 @@ function Preguntar-Secreto($texto, $actual) {
 # ---------------------------------------------------------------- desinstalar
 if ($Desinstalar) {
     Paso "Desinstalando garro-sync"
-    foreach ($t in @($TareaDiaria, $TareaPedidos)) {
+    foreach ($t in @($TareaDiaria, $TareaPedidos, "Diforte Garro - prueba de instalacion")) {
         if (Get-ScheduledTask -TaskName $t -ErrorAction SilentlyContinue) {
             Unregister-ScheduledTask -TaskName $t -Confirm:$false
             Ok "Tarea borrada: $t"
@@ -184,7 +199,28 @@ if ($Hora -notmatch '^([01]?\d|2[0-3]):[0-5]\d$') {
     throw "La hora tiene que ser HH:MM, por ejemplo 13:00 (recibido: $Hora)."
 }
 
+# Requisitos: PowerShell 5.1 y Windows 8.1 / Server 2012 R2 o superior (el Python 3.12 no corre en anteriores).
+if ($PSVersionTable.PSVersion -lt [Version]"5.1") {
+    throw "Hace falta PowerShell 5.1 (hay $($PSVersionTable.PSVersion)). En Windows Server 2012 R2 se instala con Windows Management Framework 5.1. Avisa a Alexander."
+}
+if ([Environment]::OSVersion.Version -lt [Version]"6.3") {
+    throw "Este Windows ($([Environment]::OSVersion.Version)) es anterior a Windows 8.1 / Server 2012 R2: el Python del programa no corre. Avisa a Alexander."
+}
+
+# Modo servidor: pedido con -Servidor, o heredado si alguna de las tareas existentes ya esta en S4U.
+# -Interactivo vuelve al modo PC de oficina.
+if ($Servidor -and $Interactivo) { throw "Elegir -Servidor o -Interactivo, no los dos." }
+$modosPrevios = @(foreach ($t in @($TareaDiaria, $TareaPedidos)) {
+    $tp = Get-ScheduledTask -TaskName $t -ErrorAction SilentlyContinue
+    if ($tp) { "$($tp.Principal.LogonType)" }
+})
+$ModoServidor = (-not $Interactivo) -and ($Servidor -or ($modosPrevios -contains "S4U"))
+if ($ModoServidor -and -not $Servidor -and ($modosPrevios | Where-Object { $_ -ne "S4U" })) {
+    Aviso "Las tareas existentes estaban en modos distintos ($($modosPrevios -join ', ')): quedan las dos en modo servidor."
+}
+
 Write-Host "garro-sync $Version" -ForegroundColor Cyan
+if ($ModoServidor) { Write-Host "Modo servidor: las tareas corren sin sesion iniciada." -ForegroundColor Cyan }
 
 # ---------------------------------------------------------------- carpeta + permisos (ANTES de escribir secretos)
 Paso "Carpeta y permisos"
@@ -303,7 +339,9 @@ Paso "Configuracion"
 if ($Reconfigurar -or -not (Test-Path $Config)) {
     $act = Leer-Config $Config
     $cfg = [ordered]@{}
-    $cfg["GARRO_HOST"]   = Preguntar "GARRO_HOST" $act["GARRO_HOST"] "IP de Radmin del servidor de Garro."
+    $sugerido = $act["GARRO_HOST"]
+    if (-not $sugerido -and $ModoServidor) { $sugerido = "127.0.0.1" }
+    $cfg["GARRO_HOST"]   = Preguntar "GARRO_HOST" $sugerido "En el servidor de Garro: 127.0.0.1. En otra PC: la IP de Radmin del servidor."
     $cfg["GARRO_PUERTO"] = Preguntar "GARRO_PUERTO" $(if ($act["GARRO_PUERTO"]) { $act["GARRO_PUERTO"] } else { "5432" }) $null
     $cfg["GARRO_BASE"]   = Preguntar "GARRO_BASE" $(if ($act["GARRO_BASE"]) { $act["GARRO_BASE"] } else { "GestionIntegral" }) $null
     $cfg["GARRO_USUARIO"] = Preguntar "GARRO_USUARIO" $(if ($act["GARRO_USUARIO"]) { $act["GARRO_USUARIO"] } else { "garro_lectura" }) $null
@@ -371,39 +409,127 @@ if (Confirmar "Hacer la primera copia a Supabase ahora?") {
 # ---------------------------------------------------------------- tareas programadas
 Paso "Tareas programadas"
 $usuario = "$env:USERDOMAIN\$env:USERNAME"
-# Interactive = corren con la sesion iniciada y NO se guarda ninguna contrasena de Windows.
-$principal = New-ScheduledTaskPrincipal -UserId $usuario -LogonType Interactive -RunLevel Limited
+# Interactive = corren con la sesion iniciada. S4U (modo servidor) = corren aunque nadie haya iniciado sesion.
+# En los dos casos NO se guarda ninguna contrasena de Windows.
+$tipoSesion = if ($ModoServidor) { "S4U" } else { "Interactive" }
+$principal = New-ScheduledTaskPrincipal -UserId $usuario -LogonType $tipoSesion -RunLevel Limited
 $scriptPy = Join-Path $Dir "garro_sync.py"
 $ajustes = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
     -ExecutionTimeLimit (New-TimeSpan -Minutes 30) -MultipleInstances IgnoreNew
 
-$accionDiaria = New-ScheduledTaskAction -Execute $Pyw -Argument "`"$scriptPy`"" -WorkingDirectory $Dir
-$disparadorDiario = New-ScheduledTaskTrigger -Daily -At ([datetime]::Today.Add([TimeSpan]::Parse($Hora)))
-Register-ScheduledTask -TaskName $TareaDiaria -Action $accionDiaria -Trigger $disparadorDiario `
-    -Settings $ajustes -Principal $principal -Description "Copia Gestion Integral a Supabase todos los dias." -Force | Out-Null
-Ok "$TareaDiaria (todos los dias a las $Hora)"
+# Modo servidor: prueba real con el mismo principal S4U ANTES de tocar las tareas reales (que siguen pausadas):
+# lee Garro y prueba Supabase sin escribir nada. Si falla (derecho de inicio por lotes, GPO, red de la tarea),
+# se corta aca y las tareas anteriores quedan como estaban.
+if ($ModoServidor) {
+    Paso "Prueba de las tareas sin sesion iniciada (no escribe nada)"
+    $TareaPrueba = "Diforte Garro - prueba de instalacion"
+    foreach ($argPrueba in @("--prueba", "--prueba-destino")) {
+        $accionPrueba = New-ScheduledTaskAction -Execute $Pyw -Argument "`"$scriptPy`" $argPrueba" -WorkingDirectory $Dir
+        try {
+            Register-ScheduledTask -TaskName $TareaPrueba -Action $accionPrueba -Settings $ajustes -Principal $principal `
+                -Description "Prueba temporal del instalador de garro-sync." -Force | Out-Null
+            $antes = (Get-ScheduledTaskInfo -TaskName $TareaPrueba).LastRunTime
+            Start-ScheduledTask -TaskName $TareaPrueba
+            $limite = (Get-Date).AddMinutes(10)
+            do {
+                Start-Sleep -Seconds 3
+                $estado = (Get-ScheduledTask -TaskName $TareaPrueba).State
+                $info = Get-ScheduledTaskInfo -TaskName $TareaPrueba
+                $termino = ($estado -ne "Running") -and ($info.LastRunTime -ne $antes) -and ($info.LastTaskResult -ne 267009)
+            } until ($termino -or (Get-Date) -gt $limite)
+            if (-not $termino) {
+                throw "no termino en 10 minutos (estado $estado, resultado $($info.LastTaskResult))"
+            }
+            if ($info.LastTaskResult -ne 0) {
+                throw "termino con codigo $($info.LastTaskResult) (1 = fallo del programa: el motivo queda en $Dir\garro_sync.log)"
+            }
+            Ok "$argPrueba corre bien sin sesion iniciada"
+        } catch {
+            throw "La prueba $argPrueba como tarea sin sesion iniciada fallo: $($_.Exception.Message). Las tareas anteriores no se tocaron. Si no es un fallo del programa, suele faltar el derecho 'Iniciar sesion como proceso por lotes' para $usuario: abri PowerShell con 'Ejecutar como administrador' (con este mismo usuario) y volve a correr el instalador con -Servidor."
+        } finally {
+            # Borrar la tarea no corta el programa que ya arranco: primero se detiene.
+            Stop-ScheduledTask -TaskName $TareaPrueba -ErrorAction SilentlyContinue
+            Unregister-ScheduledTask -TaskName $TareaPrueba -Confirm:$false -ErrorAction SilentlyContinue
+        }
+    }
+}
 
-# Repeticion cada 5 minutos SIN duracion: en Windows 10 (1607+) es indefinida. NO usar
-# -RepetitionDuration ([TimeSpan]::MaxValue): en Windows 10/11 Register-ScheduledTask lo rechaza (fuera de rango).
-$accionPedidos = New-ScheduledTaskAction -Execute $Pyw -Argument "`"$scriptPy`" --si-hay-pedido" -WorkingDirectory $Dir
-$disparadorPedidos = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 5)
+# Respaldo de las tareas actuales: si algo falla desde el primer registro hasta la verificacion, se restauran
+# tal como estaban (o se borran las nuevas, si no habia). Sin contrasenas: S4U e Interactive no las guardan.
+$respaldoTareas = @{}
+foreach ($t in @($TareaDiaria, $TareaPedidos)) {
+    if (Get-ScheduledTask -TaskName $t -ErrorAction SilentlyContinue) { $respaldoTareas[$t] = Export-ScheduledTask -TaskName $t }
+}
 try {
-    Register-ScheduledTask -TaskName $TareaPedidos -Action $accionPedidos -Trigger $disparadorPedidos `
-        -Settings $ajustes -Principal $principal -Description "Cada 5 minutos mira si alguien pidio Actualizar ahora." -Force | Out-Null
+    $accionDiaria = New-ScheduledTaskAction -Execute $Pyw -Argument "`"$scriptPy`"" -WorkingDirectory $Dir
+    $disparadorDiario = New-ScheduledTaskTrigger -Daily -At ([datetime]::Today.Add([TimeSpan]::Parse($Hora)))
+    try {
+        Register-ScheduledTask -TaskName $TareaDiaria -Action $accionDiaria -Trigger $disparadorDiario `
+            -Settings $ajustes -Principal $principal -Description "Copia Gestion Integral a Supabase todos los dias." -Force | Out-Null
+    } catch {
+        if ($ModoServidor) {
+            throw "Windows no dejo crear la tarea para que corra sin sesion iniciada ($($_.Exception.Message)). Abri PowerShell con 'Ejecutar como administrador' (con este mismo usuario) y volve a correr el instalador con -Servidor."
+        }
+        throw
+    }
+    Ok "$TareaDiaria (todos los dias a las $Hora)"
+
+    # Repeticion cada 5 minutos SIN duracion: en Windows 10 (1607+) es indefinida. NO usar
+    # -RepetitionDuration ([TimeSpan]::MaxValue): en Windows 10/11 Register-ScheduledTask lo rechaza (fuera de rango).
+    $accionPedidos = New-ScheduledTaskAction -Execute $Pyw -Argument "`"$scriptPy`" --si-hay-pedido" -WorkingDirectory $Dir
+    $disparadorPedidos = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 5)
+    try {
+        Register-ScheduledTask -TaskName $TareaPedidos -Action $accionPedidos -Trigger $disparadorPedidos `
+            -Settings $ajustes -Principal $principal -Description "Cada 5 minutos mira si alguien pidio Actualizar ahora." -Force | Out-Null
+    } catch {
+        $primerError = $_.Exception.Message
+        Aviso "Windows rechazo la tarea de pedidos ($primerError); se reintenta con repeticion de 10 anios."
+        $disparadorPedidos = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 5) `
+            -RepetitionDuration (New-TimeSpan -Days 3650)
+        try {
+            Register-ScheduledTask -TaskName $TareaPedidos -Action $accionPedidos -Trigger $disparadorPedidos `
+                -Settings $ajustes -Principal $principal -Description "Cada 5 minutos mira si alguien pidio Actualizar ahora." -Force | Out-Null
+        } catch {
+            if ($ModoServidor) {
+                throw "Windows no dejo crear la tarea de pedidos para que corra sin sesion iniciada ($primerError / $($_.Exception.Message)). Abri PowerShell con 'Ejecutar como administrador' (con este mismo usuario) y volve a correr el instalador con -Servidor."
+            }
+            throw
+        }
+    }
+    # Se verifica lo que quedo registrado: el tipo de sesion pedido y el intervalo PT5M (5 minutos).
+    foreach ($t in @($TareaDiaria, $TareaPedidos)) {
+        $registrado = "$((Get-ScheduledTask -TaskName $t).Principal.LogonType)"
+        if ($registrado -ne $tipoSesion) {
+            throw "La tarea '$t' quedo con sesion '$registrado' y se esperaba '$tipoSesion'. Avisa a Alexander."
+        }
+    }
+    $rep = (Get-ScheduledTask -TaskName $TareaPedidos).Triggers[0].Repetition
+    $dur = "$($rep.Duration)"
+    if ($rep.Interval -ne "PT5M" -or ($dur -ne "" -and $dur -ne "P3650D")) {
+        throw "La tarea '$TareaPedidos' quedo con una repeticion inesperada (intervalo '$($rep.Interval)', duracion '$dur'; se esperaba PT5M y duracion vacia o P3650D). Avisa a Alexander."
+    }
+    Ok "$TareaPedidos (cada 5 minutos, repeticion: intervalo $($rep.Interval), duracion '$($rep.Duration)' - vacia = indefinida)"
 } catch {
-    Aviso "Windows no acepto la repeticion sin duracion; se reintenta con 10 anios."
-    $disparadorPedidos = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 5) `
-        -RepetitionDuration (New-TimeSpan -Days 3650)
-    Register-ScheduledTask -TaskName $TareaPedidos -Action $accionPedidos -Trigger $disparadorPedidos `
-        -Settings $ajustes -Principal $principal -Description "Cada 5 minutos mira si alguien pidio Actualizar ahora." -Force | Out-Null
+    $motivo = $_.Exception.Message
+    $sinRestaurar = New-Object System.Collections.ArrayList
+    foreach ($t in @($TareaDiaria, $TareaPedidos)) {
+        try {
+            if ($respaldoTareas.ContainsKey($t)) {
+                Register-ScheduledTask -TaskName $t -Xml $respaldoTareas[$t] -Force | Out-Null
+                if (-not (Get-ScheduledTask -TaskName $t -ErrorAction SilentlyContinue)) { throw "no quedo registrada" }
+            } elseif (Get-ScheduledTask -TaskName $t -ErrorAction SilentlyContinue) {
+                Unregister-ScheduledTask -TaskName $t -Confirm:$false
+            }
+        } catch {
+            [void]$sinRestaurar.Add("$t ($($_.Exception.Message))")
+        }
+    }
+    if ($sinRestaurar.Count -gt 0) {
+        throw "No se pudieron dejar las tareas programadas ($motivo) y la restauracion quedo INCOMPLETA: $($sinRestaurar -join '; '). Revisar en el Programador de tareas y avisar a Alexander."
+    }
+    throw "No se pudieron dejar las tareas programadas ($motivo). Se restauraron las definiciones anteriores y al salir se vuelven a habilitar (si aparece un aviso en rojo, esa hay que habilitarla a mano). Avisa a Alexander."
 }
-# Se verifica lo que quedo registrado: el intervalo tiene que ser PT5M (5 minutos).
-$rep = (Get-ScheduledTask -TaskName $TareaPedidos).Triggers[0].Repetition
-$dur = "$($rep.Duration)"
-if ($rep.Interval -ne "PT5M" -or ($dur -ne "" -and $dur -ne "P3650D")) {
-    throw "La tarea '$TareaPedidos' quedo con una repeticion inesperada (intervalo '$($rep.Interval)', duracion '$dur'; se esperaba PT5M y duracion vacia o P3650D). Avisa a Alexander."
-}
-Ok "$TareaPedidos (cada 5 minutos, repeticion: intervalo $($rep.Interval), duracion '$($rep.Duration)' - vacia = indefinida)"
+
 
 # ---------------------------------------------------------------- acceso directo
 Paso "Acceso directo"
@@ -422,7 +548,11 @@ Write-Host "Version:  $Version"
 Write-Host "Carpeta:  $Dir"
 Write-Host "Tareas:   $TareaDiaria (a las $Hora)"
 Write-Host "          $TareaPedidos (cada 5 minutos)"
-Write-Host "Las tareas corren con la sesion de $usuario iniciada: la PC tiene que estar prendida, con Radmin conectado."
+if ($ModoServidor) {
+    Write-Host "Modo servidor: las tareas corren como $usuario aunque nadie haya iniciado sesion."
+} else {
+    Write-Host "Las tareas corren con la sesion de $usuario iniciada: la PC tiene que estar prendida, con Radmin conectado."
+}
 Write-Host ""
 Write-Host "Para actualizar ahora:"
 Write-Host "  - en esta PC: doble clic en '$NombreAtajo' (escritorio)"

@@ -552,6 +552,35 @@ class IntegridadDelPaquete(unittest.TestCase):
         activas = [l for l in texto.decode("ascii").splitlines() if not l.lstrip().startswith("#")]
         self.assertFalse(any("TimeSpan]::MaxValue" in l for l in activas))  # rompe Register-ScheduledTask en Win10/11
 
+    def test_modo_servidor_prueba_s4u_antes_de_tocar_las_tareas_reales(self):
+        texto = open(os.path.join(AQUI, "install.ps1"), encoding="ascii", newline="").read()
+        activo = "\n".join(l for l in texto.splitlines() if not l.lstrip().startswith("#"))
+        prueba = activo.index('Paso "Prueba de las tareas sin sesion iniciada')
+        self.assertLess(prueba, activo.index("Register-ScheduledTask -TaskName $TareaDiaria"))
+        self.assertLess(prueba, activo.index("Register-ScheduledTask -TaskName $TareaPedidos"))
+        self.assertIn('-LogonType $tipoSesion', activo)
+        self.assertIn('$PSVersionTable.PSVersion -lt [Version]"5.1"', activo)
+        # La prueba corre las dos verificaciones, espera su fin, exige codigo 0 y siempre borra la tarea temporal.
+        bloque = activo[prueba:activo.index("Register-ScheduledTask -TaskName $TareaDiaria")]
+        for esperado in ('@("--prueba", "--prueba-destino")', "Start-ScheduledTask -TaskName $TareaPrueba",
+                         "LastTaskResult -ne 267009", "LastTaskResult -ne 0", "AddMinutes(10)",
+                         "Las tareas anteriores no se tocaron"):
+            self.assertIn(esperado, bloque)
+        self.assertLess(bloque.index("} catch {"), bloque.index("} finally {"))
+        fin = bloque[bloque.index("} finally {"):]
+        self.assertLess(fin.index("Stop-ScheduledTask -TaskName $TareaPrueba"), fin.index("Unregister-ScheduledTask -TaskName $TareaPrueba"))
+        # Una restauracion fallida no se informa como exitosa.
+        self.assertIn("restauracion quedo INCOMPLETA", activo)
+        # Respaldo antes del primer registro real y restauracion en el catch de toda la seccion.
+        respaldo = activo.index("Export-ScheduledTask -TaskName $t")
+        self.assertLess(respaldo, activo.index("Register-ScheduledTask -TaskName $TareaDiaria"))
+        restaura = activo.index("Register-ScheduledTask -TaskName $t -Xml $respaldoTareas[$t] -Force")
+        self.assertLess(activo.index("throw \"La tarea '$t' quedo con sesion"), restaura)
+        self.assertLess(activo.index("Ok \"$TareaPedidos (cada 5 minutos"), restaura)
+        # -Desinstalar tambien borra una tarea de prueba que haya quedado.
+        desinstalar = activo[activo.index("if ($Desinstalar) {"):]
+        self.assertIn("Diforte Garro - prueba de instalacion", desinstalar[:desinstalar.index("return")])
+
 
 class GuardiaDeFoto(unittest.TestCase):
     def test_obligatorias_vacias_se_rechazan(self):
