@@ -61,7 +61,12 @@ cd "$env:LOCALAPPDATA\Diforte\garro-sync"
 .\python\python.exe relevar_compras.py foto       # justo antes de cargar un comprobante
 # ...se carga UN comprobante en Gestión Integral, como siempre...
 .\python\python.exe relevar_compras.py comparar   # justo después: lista las tablas que cambiaron
+.\python\python.exe relevar_compras.py pagos      # estructura y ejemplos de pagos, cheques, cajas y fondos
 ```
+
+El modo `pagos` vuelca las columnas, claves y cantidad de filas de las tablas de pagos, cheques, cajas y movimientos de fondos, las tablas chicas de referencia (tipos de pago, cajas, bancos, condiciones de compra) y los últimos pagos, movimientos y cheques con todo lo que cuelga de ellos. De los números de cuenta, CBU y CUIT de firmantes de cheques solo quedan los últimos 4 dígitos; nombres y domicilios de terceros no salen.
+
+La `foto` y la `comparar` de una misma carga se sacan con la misma versión: desde v1.3.0 cambia el hash de las filas con datos bancarios o personales.
 
 ## Guardia
 

@@ -7,6 +7,7 @@ Viene con garro-sync y usa su Python y su .env.garro-sync. Desde la carpeta de i
     .\\python\\python.exe relevar_compras.py foto
         (se carga UN comprobante en Gestión Integral, como siempre)
     .\\python\\python.exe relevar_compras.py comparar      (contra la última foto)
+    .\\python\\python.exe relevar_compras.py pagos         (estructura y ejemplos de pagos, cheques y cajas)
 
 La sesión se abre READ ONLY (conectar_origen de garro_sync): este script no puede escribir en la base.
 Lo que produce queda en la carpeta `relevamiento\\` y no se sube a ningún lado.
@@ -38,6 +39,28 @@ REFERENCIA = [
     "planes_de_cuentas", "planes_de_cuentas_config", "tipos_iva", "monedas", "monedas_historicos",
     "productos_depositos", "productos_rubros", "productos_unidades_de_medidas",
 ]
+# Modo `pagos`: tablas cuya estructura se vuelca entera (columnas, tipos, PK, FKs, conteo).
+PATRONES_PAGOS = ("pago", "cheque", "caja", "fondo", "banc", "billetera", "tarjeta", "efectivo", "medio_de_pago",
+                  "ajustes_cuenta_corriente_proveedores", "regimenes_especiales", "condiciones_compra", "retencion")
+# Tablas chicas de referencia de pagos y caja que se copian enteras.
+REFERENCIA_PAGOS = ["tipos_pagos", "cajas", "condiciones_compra", "bancos", "cuentas_bancarias",
+                    "movimientos_fondos_tipos", "movimientos_fondos_categorias", "billeteras_virtuales",
+                    "tarjetas_creditos_propias", "regimenes_especiales", "tipos_regimenes_compras", "impuestos_compras"]
+# Al juntar ejemplos de pagos se sube por la FK a estas tablas (el cheque, el medio de pago, la factura)...
+SUBIR_PAGOS = {"cheques", "cheques_propios", "efectivo_medio_de_pago", "efectivo_deposito_bancario",
+               "movimientos_cuentas_bancarias",
+               "movimientos_billeteras_virtuales", "otro_medio_de_pago", "comprobantes_compras",
+               "ajustes_cuenta_corriente_proveedores", "pagos", "movimientos_fondos", "movimientos_caja"}
+# ...y desde estas, una vez alcanzadas hacia arriba, se vuelve a bajar (cheques_de_terceros cuelga de cheques).
+BAJAR_DESDE_ARRIBA = {"pagos", "movimientos_fondos", "movimientos_caja", "cheques", "cheques_propios",
+                      "efectivo_medio_de_pago", "efectivo_deposito_bancario", "movimientos_cuentas_bancarias",
+                      "movimientos_billeteras_virtuales", "otro_medio_de_pago"}
+POR_GRUPO_PAGOS = 3
+ULTIMOS_PAGOS = 20
+# Números de cuenta, CBU y CUIT de firmantes de cheques: solo los últimos 4 caracteres.
+PARCIALES = ("nro_cuenta", "cbu", "alias", "cuit_cheque")
+# Datos personales de terceros (firmantes de cheques, contactos): no salen.
+PERSONALES = ("dir_", "cp_", "loc_", "tel", "mail", "email", "domicilio", "celular", "des_cheque_de_tercero")
 # Clave del hash de las columnas sensibles: sale de la contraseña de la base, que nunca se exporta. Así una foto
 # no trae un MD5 de una contraseña o un token que se pueda atacar por diccionario.
 SAL: str | None = None
@@ -55,8 +78,21 @@ def es_sensible(columna: str) -> bool:
     return c in SENSIBLES_EXACTAS or any(s in c for s in SENSIBLES) or c.startswith("imagen")
 
 
+def es_personal(columna: str) -> bool:
+    c = columna.lower()
+    return c.startswith(PERSONALES) or any(p in c for p in PARCIALES)
+
+
 def limpiar(fila: dict) -> dict:
-    return {k: ("<omitido>" if es_sensible(k) else v) for k, v in fila.items()}
+    out = {}
+    for k, v in fila.items():
+        if es_sensible(k) or k.lower().startswith(PERSONALES):
+            out[k] = "<omitido>"
+        elif v is not None and any(p in k.lower() for p in PARCIALES):
+            out[k] = "…" + str(v)[-4:]
+        else:
+            out[k] = v
+    return out
 
 
 def guardar(nombre: str, datos) -> str:
@@ -240,6 +276,151 @@ def muestras(cur, existentes: set[str]) -> dict:
     return {"comprobantes": raiz, "filas": {t: list(v.values()) for t, v in juntado.items()}}
 
 
+# ------------------------------------------------------------------ pagos, cheques y cajas
+
+def claves_foraneas(cur) -> dict[tuple[str, str], str]:
+    """(tabla, columna) -> tabla referenciada, solo FKs de una columna."""
+    cur.execute("""SELECT c.relname, a.attname, r.relname
+                   FROM pg_constraint k JOIN pg_class c ON c.oid = k.conrelid
+                   JOIN pg_namespace n ON n.oid = c.relnamespace JOIN pg_class r ON r.oid = k.confrelid
+                   JOIN pg_attribute a ON a.attrelid = k.conrelid AND a.attnum = k.conkey[1]
+                   WHERE k.contype = 'f' AND n.nspname = 'public' AND array_length(k.conkey, 1) = 1""")
+    return {(t, col): ref for t, col, ref in cur.fetchall()}
+
+
+def ids_de(cur, consulta: sql.Composable, params=None) -> list:
+    cur.execute(consulta, params)
+    return [r[0] for r in cur.fetchall()]
+
+
+def ultimos(cur, tabla: str, pk: str, n: int, por: str | None, cols: list[str]) -> list:
+    """Los n últimos de la tabla, más los POR_GRUPO_PAGOS últimos de cada valor de `por` (si la columna existe)."""
+    out = ids_de(cur, sql.SQL("SELECT {} FROM public.{} ORDER BY 1 DESC LIMIT %s").format(
+        sql.Identifier(pk), sql.Identifier(tabla)), (n,))
+    if por and por in cols:
+        out += ids_de(cur, sql.SQL("""SELECT id FROM (SELECT {pk} AS id, row_number() OVER (PARTITION BY {por}
+                                       ORDER BY {pk} DESC) AS n FROM public.{t}) s WHERE n <= %s""").format(
+            pk=sql.Identifier(pk), por=sql.Identifier(por), t=sql.Identifier(tabla)), (POR_GRUPO_PAGOS,))
+    return sorted(set(out))
+
+
+def juntar_pagos(cur, raices: dict[str, list], existentes: set[str]) -> dict:
+    """Desde las raíces: baja por fk_id_X -> id_X (como `muestras`) y sube por FK a SUBIR_PAGOS.
+
+    Lo alcanzado hacia arriba no se vuelve a bajar (salvo BAJAR_DESDE_ARRIBA): una factura traería todo lo suyo.
+    Proveedores, operarios y cajas no se suben: el id alcanza (proveedores ya está en la copia; cajas va en referencia).
+    """
+    pk = claves_primarias(cur)
+    fks = claves_foraneas(cur)
+    cur.execute("""SELECT table_name, column_name FROM information_schema.columns
+                   WHERE table_schema = 'public' AND column_name LIKE 'fk\\_id\\_%'""")
+    hijos: dict[str, list[tuple[str, str]]] = {}
+    for t, col in cur.fetchall():
+        hijos.setdefault(col[3:], []).append((t, col))
+
+    juntado: dict[str, dict[str, dict]] = {}
+    # frente: (tabla, puede_bajar) -> ids
+    frente: dict[tuple[str, bool], set] = {(t, True): set(ids) for t, ids in raices.items() if ids}
+    for _ in range(PROFUNDIDAD + 2):
+        nuevo: dict[tuple[str, bool], set] = {}
+        for (tabla, puede_bajar), ids in frente.items():
+            cols = pk.get(tabla)
+            if tabla not in existentes or not cols or len(cols) != 1:
+                continue
+            ya = juntado.setdefault(tabla, {})
+            pedir = [i for i in ids if str(i) not in ya]
+            if pedir:
+                for f in filas(cur, sql.SQL("SELECT row_to_json(t) AS r FROM public.{} t WHERE t.{} = ANY(%s)").format(
+                        sql.Identifier(tabla), sql.Identifier(cols[0])), (pedir,)):
+                    fila = f["r"]
+                    ya[str(fila[cols[0]])] = limpiar(fila)
+                    for col, v in fila.items():  # hacia arriba
+                        ref = fks.get((tabla, col))
+                        if v is not None and ref in SUBIR_PAGOS and str(v) not in juntado.get(ref, {}):
+                            nuevo.setdefault((ref, ref in BAJAR_DESDE_ARRIBA), set()).add(v)
+            if not (puede_bajar and ids):
+                continue
+            for hija, col in hijos.get(cols[0], []):  # hacia abajo
+                if hija not in existentes or not pk.get(hija) or len(pk[hija]) != 1:
+                    continue
+                vistos = juntado.get(hija, {})
+                nuevos = {i for i in ids_de(cur, sql.SQL("SELECT t.{} FROM public.{} t WHERE t.{} = ANY(%s)").format(
+                    sql.Identifier(pk[hija][0]), sql.Identifier(hija), sql.Identifier(col)), (list(ids),))
+                    if str(i) not in vistos}
+                if nuevos:
+                    nuevo.setdefault((hija, True), set()).update(nuevos)
+        frente = nuevo
+    return {t: list(v.values()) for t, v in juntado.items() if v}
+
+
+def pagos(con) -> str:
+    with con.cursor() as cur:
+        out: dict = {"generado": datetime.now().isoformat(), "version": con.server_version}
+        existentes = set(tablas(cur))
+        pk = claves_primarias(cur)
+        fks = claves_foraneas(cur)
+        cur.execute("""SELECT c.relname, a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull
+                       FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid
+                       JOIN pg_namespace n ON n.oid = c.relnamespace
+                       WHERE n.nspname = 'public' AND c.relkind = 'r' AND a.attnum > 0 AND NOT a.attisdropped
+                       ORDER BY c.relname, a.attnum""")
+        todas: dict[str, list[dict]] = {}
+        for t, col, tipo, notnull in cur.fetchall():
+            todas.setdefault(t, []).append({"columna": col, "tipo": tipo, "not_null": notnull,
+                                            "fk": fks.get((t, col))})
+        elegidas = sorted(t for t in existentes if any(p in t for p in PATRONES_PAGOS))
+        estructura: dict = {}
+        for t in elegidas:
+            cur.execute(sql.SQL("SELECT count(*) FROM public.{}").format(sql.Identifier(t)))
+            cols = todas.get(t, [])
+            item = {"filas": cur.fetchone()[0], "pk": pk.get(t), "columnas": cols}
+            # Cuántas filas por cada estado o tipo: dice qué se usa de verdad.
+            grupos = {}
+            for c in cols:
+                nombre = c["columna"]
+                if t in TABLAS_SECRETAS or es_sensible(nombre) or es_personal(nombre):
+                    continue
+                if (nombre.startswith(("estado", "tipo_", "es_", "fk_id_tipo", "fk_id_caja", "fk_id_moneda"))
+                        or nombre in ("fk_id_movimiento_fondo_tipo", "fk_id_condicion_compra", "genera_cta_cte",
+                                      "genera_ctacte", "ctacte")):
+                    grupos[nombre] = [{"valor": v, "n": n} for v, n in ids_de_pares(cur, sql.SQL(
+                        "SELECT {c}::text, count(*) FROM public.{t} GROUP BY 1 ORDER BY 2 DESC LIMIT 30").format(
+                        c=sql.Identifier(nombre), t=sql.Identifier(t)))]
+            item["por_valor"] = grupos
+            estructura[t] = item
+        out["estructura"] = estructura
+        out["referencia"] = {}
+        for t in REFERENCIA_PAGOS:
+            if t in existentes and t not in TABLAS_SECRETAS:
+                out["referencia"][t] = [limpiar(r["r"]) for r in filas(
+                    cur, sql.SQL("SELECT row_to_json(t) AS r FROM public.{} t").format(sql.Identifier(t)))]
+
+        def raiz(tabla: str, por: str | None, n: int = ULTIMOS_PAGOS) -> list:
+            cols = [c["columna"] for c in todas.get(tabla, [])]
+            if tabla not in existentes or not pk.get(tabla) or len(pk[tabla]) != 1:
+                return []
+            return ultimos(cur, tabla, pk[tabla][0], n, por, cols)
+
+        raices = {
+            "pagos": raiz("pagos", "fk_id_tipo_pago"),
+            "movimientos_fondos": raiz("movimientos_fondos", "fk_id_movimiento_fondo_tipo"),
+            "movimientos_caja": raiz("movimientos_caja", "fk_id_caja", 10),
+            "cheques": raiz("cheques", "estado_cheque", 10),
+            "ajustes_cuenta_corriente_proveedores": raiz("ajustes_cuenta_corriente_proveedores", None, 10),
+            # Compras por condición (contado / cuenta corriente): cómo queda pagada una compra contado.
+            "comprobantes_compras": raiz("comprobantes_compras", "fk_id_condicion_compra", 5),
+        }
+        out["raices"] = raices
+        out["muestras"] = juntar_pagos(cur, raices, existentes)
+    con.rollback()
+    return guardar(f"pagos-{ahora()}.json", out)
+
+
+def ids_de_pares(cur, consulta: sql.Composable, params=None) -> list[tuple]:
+    cur.execute(consulta, params)
+    return cur.fetchall()
+
+
 # ------------------------------------------------------------------ foto y comparación
 
 def columnas(cur) -> dict[str, list[str]]:
@@ -255,7 +436,7 @@ def columnas(cur) -> dict[str, list[str]]:
 
 def expr_hash(cols: list[str]) -> tuple[sql.Composable, list[str]]:
     """md5 de la fila; las columnas sensibles entran solo como hash con clave (SAL), nunca crudas."""
-    sensibles = [c for c in cols if es_sensible(c)]
+    sensibles = [c for c in cols if es_sensible(c) or es_personal(c)]
     if not sensibles:
         return sql.SQL("md5(t::text)"), []
     assert SAL, "SAL sin inicializar: usar conectar()"
@@ -358,7 +539,7 @@ def comparar(con, ruta_antes: str) -> str:
 
 
 def main(argv: list[str]) -> int:
-    if not argv or argv[0] not in ("catalogo", "foto", "comparar"):
+    if not argv or argv[0] not in ("catalogo", "foto", "comparar", "pagos"):
         print(__doc__)
         return 2
     antes = argv[1] if len(argv) > 1 else None
@@ -374,6 +555,8 @@ def main(argv: list[str]) -> int:
     try:
         if argv[0] == "catalogo":
             ruta = catalogo(con)
+        elif argv[0] == "pagos":
+            ruta = pagos(con)
         elif argv[0] == "foto":
             ruta = foto(con)
         else:
