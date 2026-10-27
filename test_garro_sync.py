@@ -552,6 +552,14 @@ class IntegridadDelPaquete(unittest.TestCase):
         activas = [l for l in texto.decode("ascii").splitlines() if not l.lstrip().startswith("#")]
         self.assertFalse(any("TimeSpan]::MaxValue" in l for l in activas))  # rompe Register-ScheduledTask en Win10/11
 
+    def test_install_ps1_sin_variables_seguidas_de_dos_puntos(self):
+        # "$usuario:" dentro de comillas es un error de parseo en PowerShell (lo toma como unidad/ambito):
+        # todo el script falla antes de correr. Se escribe "${usuario}:".
+        texto = open(os.path.join(AQUI, "install.ps1"), encoding="ascii", newline="").read()
+        malas = [m.group(0) for m in re.finditer(r"\$([A-Za-z_][A-Za-z0-9_]*):", texto)
+                 if m.group(1).lower() not in ("env", "script", "global", "local", "using", "private", "function", "variable")]
+        self.assertEqual(malas, [])
+
     def test_modo_servidor_prueba_s4u_antes_de_tocar_las_tareas_reales(self):
         texto = open(os.path.join(AQUI, "install.ps1"), encoding="ascii", newline="").read()
         activo = "\n".join(l for l in texto.splitlines() if not l.lstrip().startswith("#"))

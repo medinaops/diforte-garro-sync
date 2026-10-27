@@ -37,7 +37,7 @@ $ProgressPreference = "SilentlyContinue"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # ---------------------------------------------------------------- constantes
-$Version         = "v1.3.2"
+$Version         = "v1.3.3"
 $Repo            = "medinaops/diforte-garro-sync"
 # Por usuario: en C:\ cualquier usuario puede crear carpetas y plantar un python.exe; en LOCALAPPDATA no.
 $Dir             = Join-Path $env:LOCALAPPDATA "Diforte\garro-sync"
@@ -445,7 +445,7 @@ if ($ModoServidor) {
             }
             Ok "$argPrueba corre bien sin sesion iniciada"
         } catch {
-            throw "La prueba $argPrueba como tarea sin sesion iniciada fallo: $($_.Exception.Message). Las tareas anteriores no se tocaron. Si no es un fallo del programa, suele faltar el derecho 'Iniciar sesion como proceso por lotes' para $usuario: abri PowerShell con 'Ejecutar como administrador' (con este mismo usuario) y volve a correr el instalador con -Servidor."
+            throw "La prueba $argPrueba como tarea sin sesion iniciada fallo: $($_.Exception.Message). Las tareas anteriores no se tocaron. Si no es un fallo del programa, suele faltar el derecho 'Iniciar sesion como proceso por lotes' para ${usuario}: abri PowerShell con 'Ejecutar como administrador' (con este mismo usuario) y volve a correr el instalador con -Servidor."
         } finally {
             # Borrar la tarea no corta el programa que ya arranco: primero se detiene.
             Stop-ScheduledTask -TaskName $TareaPrueba -ErrorAction SilentlyContinue
