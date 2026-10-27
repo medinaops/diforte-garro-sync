@@ -146,12 +146,12 @@ def correr_main(cursores, cfg=None, leer=None):
 
 
 class ParidadMigracion(unittest.TestCase):
-    """TABLAS tiene que coincidir con las migraciones 329 + 350 (tablas, columnas, tipos, PK, GRANT)."""
+    """TABLAS tiene que coincidir con las migraciones 329 + 350 + 372 (tablas, columnas, tipos, PK, GRANT)."""
 
     @classmethod
     def setUpClass(cls):
         cls.sql = ""
-        for numero in (329, 350):
+        for numero in (329, 350, 372):
             with open(migracion(numero), encoding="utf-8") as f:
                 cls.sql += f.read() + "\n"
 
@@ -168,6 +168,9 @@ class ParidadMigracion(unittest.TestCase):
                 if m.group(3):
                     pk = m.group(1)
             migracion[nombre] = (pk, cols)
+        # Columnas agregadas después (mig 372: comprobantes_compras), al final y en orden.
+        for nombre, col, tipo in re.findall(r"ALTER TABLE garro\.(\w+) ADD COLUMN (\w+) ([a-z ]+?);", self.sql):
+            migracion[nombre][1].append((col, tipo))
         script = {n: (pk, cols) for n, pk, cols in g.TABLAS}
         self.assertEqual(list(script), list(migracion))
         for nombre in script:
@@ -603,6 +606,41 @@ class IntegridadDelPaquete(unittest.TestCase):
         # -Desinstalar tambien borra una tarea de prueba que haya quedado.
         desinstalar = activo[activo.index("if ($Desinstalar) {"):]
         self.assertIn("Diforte Garro - prueba de instalacion", desinstalar[:desinstalar.index("return")])
+
+
+class MediosSinCopiar(unittest.TestCase):
+    """Medios de pago que no se copian: si empiezan a usarse, la copia frena en vez de perder importes."""
+
+    class Cur:
+        def __init__(self, existentes, filas):
+            self.existentes, self.filas, self.ultimo, self.consultas = existentes, filas, None, []
+
+        def execute(self, sql, params=None):
+            self.consultas.append(sql)
+            self.ultimo = (sql, params)
+
+        def fetchall(self):
+            return [(t,) for t in self.existentes]
+
+        def fetchone(self):
+            nombre = re.search(r'public\."(\w+)"', self.ultimo[0]).group(1)
+            return (self.filas.get(nombre, 0),)
+
+    def test_cuenta_solo_las_que_existen_y_tienen_filas(self):
+        cur = self.Cur(["tarjetas_creditos_propias_en_pagos", "cheques_en_movimientos_fondos", "otra_tabla"],
+                       {"tarjetas_creditos_propias_en_pagos": 3})
+        self.assertEqual(g.contar_sin_copiar(cur), {"tarjetas_creditos_propias_en_pagos": 3})
+        self.assertFalse(any("otra_tabla" in q for q in cur.consultas))
+
+    def test_frena_salvo_forzar(self):
+        g.validar_sin_copiar({}, False)
+        g.validar_sin_copiar({"tarjetas_creditos_propias_en_pagos": 1}, True)
+        with self.assertRaises(g.ErrorGuardia) as ctx:
+            g.validar_sin_copiar({"tarjetas_creditos_propias_en_pagos": 1}, False)
+        self.assertIn("tarjetas_creditos_propias_en_pagos", str(ctx.exception))
+
+    def test_sin_copiar_no_se_superpone_con_tablas(self):
+        self.assertFalse(set(g.SIN_COPIAR) & {n for n, _, _ in g.TABLAS})
 
 
 class GuardiaDeFoto(unittest.TestCase):

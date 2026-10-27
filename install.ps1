@@ -45,7 +45,7 @@ $ProgressPreference = "SilentlyContinue"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # ---------------------------------------------------------------- constantes
-$Version         = "v1.3.5"
+$Version         = "v1.4.0"
 $Repo            = "medinaops/diforte-garro-sync"
 # Por usuario: en C:\ cualquier usuario puede crear carpetas y plantar un python.exe; en LOCALAPPDATA no.
 $Dir             = Join-Path $env:LOCALAPPDATA "Diforte\garro-sync"
@@ -59,7 +59,7 @@ $PythonSha256    = "0eb85c2dfccccf1b17352de4c397f69194035b7d37149eacc16f1147d93d
 # BEGIN HASHES
 $HashesPaquete = @{
     "actualizar-ahora.bat" = "82b5fc5df5775d5d6680c085c5b5f417cc5f7658be8ecc8a3b9029218776e177"
-    "garro_sync.py" = "800c525b5f38fcc7c53f9935e78b99e236ae0cc1d798ee7cbfdda66fdc42f62b"
+    "garro_sync.py" = "bb198a396fb40e74358f02305d2d07847034c8b91190b02f86bca95d971ce2de"
     "relevar_compras.py" = "99ab32c337c8e25ed4c6eb23c85188fb53802ddfffa6d39849c9d0437883a5cf"
     "requirements.txt" = "b3e919e8eac4bfae6f8d92ab116ee3fef65ce487bc818cbcbb38228be74e3703"
     "supabase-ca-2021.crt" = "700723581420dd1ac98fd7e9ac529f0ef210eadcaf87fc868a3ad7d114c2f3b7"

@@ -1,6 +1,6 @@
 # garro-sync: copia de Gestión Integral a Supabase
 
-Copia los comprobantes de venta y compra, las cotizaciones, clientes, proveedores, productos y catálogos de **Gestión Integral** (Garro Sistemas) a una base de Supabase, para el módulo de costos de Diforte. Corre en el servidor de Garro o en una PC de oficina de Windows. Este repo es público a propósito: no lleva contraseñas, IPs ni datos internos (esos se piden al instalar y quedan solo en esa PC).
+Copia los comprobantes de venta y compra, las cotizaciones, los pagos a proveedores con sus medios, los cheques, los movimientos de fondos, clientes, proveedores, productos y catálogos de **Gestión Integral** (Garro Sistemas) a una base de Supabase, para el módulo de costos de Diforte. Corre en el servidor de Garro o en una PC de oficina de Windows. Este repo es público a propósito: no lleva contraseñas, IPs ni datos internos (esos se piden al instalar y quedan solo en esa PC).
 
 - Lee Gestión Integral con un usuario de **solo lectura** y la sesión abierta en modo solo lectura.
 - Escribe en Supabase con un rol que solo puede vaciar e insertar en su schema, por conexión verificada (`sslmode=verify-full` con la CA de Supabase que viaja en este repo, y SCRAM obligatorio).
@@ -94,6 +94,8 @@ El modo `pagos` vuelca las columnas, claves y cantidad de filas de las tablas de
 Antes de vaciar el espejo se valida lo leído. Si algo no cierra, **no se publica nada y sigue la copia anterior**; el motivo queda registrado y se ve en el sistema.
 
 - Las tablas clave (comprobantes, ítems, clientes, proveedores, productos, tipos, monedas) nunca pueden venir vacías.
+- Desde la v1.4.0 tampoco pueden venir vacíos pagos, cheques y movimientos de fondos.
+- Algunos medios de pago que Gestión Integral tiene, pero que no se usaban cuando se armó la copia, no se copian: tarjetas, billeteras virtuales, depósitos en efectivo, cheques en movimientos de fondos, retenciones de Ganancias, percepciones y saldos sin imputar. Si alguno empieza a usarse, la copia frena con un aviso, para no dejar pagos o gastos sin su importe, hasta que se lo sume a la copia.
 - Contra la última copia correcta: una tabla no puede pasar de tener filas a cero; comprobantes e ítems no pueden bajar más de 2 %; el resto, más de 20 %. Bajas de hasta 2 filas no alertan.
 
 `--forzar` saltea la guardia. Es solo para uso manual cuando una baja es real y esperada; las tareas programadas nunca la usan.

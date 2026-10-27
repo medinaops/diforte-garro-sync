@@ -26,7 +26,7 @@ Uso:
     python garro_sync.py --si-hay-pedido  # copia solo si alguien pidió «Actualizar ahora» (tarea de cada 5 min)
     python garro_sync.py --prueba-destino # prueba la conexión segura y la contraseña de Supabase; no escribe nada
     python garro_sync.py --forzar      # copia saltando la guardia de la foto (solo uso manual)
-    python garro_sync.py --ddl         # imprime el SQL de las tablas espejo (mig 329 + 350)
+    python garro_sync.py --ddl         # imprime el SQL de las tablas espejo (migs 329 + 350 + 372)
 
 Configuración: archivo `.env.garro-sync` al lado de este script (ver README.md).
 """
@@ -53,7 +53,7 @@ from datetime import datetime, timezone
 # De las cotizaciones (`presupuestos` en Garro, distintas del comprobante de venta tipo «Presupuesto»)
 # se copian cabecera, cliente, ítems, producto y concepto de cada ítem; NO se copian el operario
 # ni los recordatorios.
-# Esta lista es la fuente de verdad de las migraciones 329 + 350 (`--ddl`): si se cambia,
+# Esta lista es la fuente de verdad de las migraciones 329 + 350 + 372 (`--ddl`): si se cambia,
 # va una migración nueva con el mismo cambio.
 TABLAS: list[tuple[str, str, list[tuple[str, str]]]] = [
     ("tipos_comprobantes_ventas", "id_tipo_comprobante_venta", [
@@ -141,6 +141,9 @@ TABLAS: list[tuple[str, str, list[tuple[str, str]]]] = [
         ("fk_id_tipo_comprobante_compra", "integer"), ("fk_id_proveedor", "integer"),
         ("porc_desc_comprobante_compra", "double precision"), ("fk_id_moneda", "integer"),
         ("imp_moneda", "double precision"),
+        # mig 372: condición, si genera cuenta corriente y vencimiento (saldo de proveedores).
+        ("fk_id_condicion_compra", "integer"), ("genera_cta_cte", "boolean"),
+        ("fec_venc_comprobante_compra", "timestamp"),
     ]),
     ("items_comprobantes_compras", "id_item_comprobante_compra", [
         ("id_item_comprobante_compra", "integer"), ("fk_id_comprobante_compra", "integer"),
@@ -211,6 +214,134 @@ TABLAS: list[tuple[str, str, list[tuple[str, str]]]] = [
         ("id_concepto_x_item_presupuesto", "integer"), ("fk_id_concepto_presupuesto", "integer"),
         ("fk_id_item_presupuesto", "integer"),
     ]),
+    # mig 372: pagos a proveedores y sus medios, cheques (cartera y entregados), cajas, cuentas y movimientos de
+    # fondos. Sin observaciones libres, operarios, números de cuenta, localidades ni firmantes; de recibos (lado
+    # clientes) solo lo necesario para saber de qué cliente vino cada cheque.
+    ("condiciones_compra", "id_condicion_compra", [
+        ("id_condicion_compra", "integer"), ("des_condicion_compra", "text"), ("ctacte", "boolean"),
+        ("dias_condicion_compra", "integer"), ("genera_cta_cte", "boolean"),
+    ]),
+    ("tipos_pagos", "id_tipo_pago", [
+        ("id_tipo_pago", "integer"), ("des_tipo_pago", "text"), ("es_ctacte", "boolean"),
+    ]),
+    ("cajas", "id_caja", [
+        ("id_caja", "integer"), ("des_caja", "text"), ("habilitada", "boolean"),
+    ]),
+    ("bancos", "id_banco", [
+        ("id_banco", "integer"), ("des_banco", "text"),
+    ]),
+    ("cuentas_bancarias", "id_cuenta_bancaria", [
+        ("id_cuenta_bancaria", "integer"), ("fk_id_banco", "integer"), ("tipo_cuenta_bancaria", "text"),
+        ("fk_id_plan_de_cuenta", "integer"), ("es_activa", "boolean"),
+    ]),
+    ("pagos", "id_pago", [
+        ("id_pago", "integer"), ("fec_pago", "timestamp"), ("nro_suc_pago", "double precision"),
+        ("nro_pago", "double precision"), ("fk_id_proveedor", "integer"), ("fk_id_tipo_pago", "integer"),
+        ("fec_carga_pago", "timestamp"),
+    ]),
+    ("pagos_en_comprobantes_compras", "id_pago_en_comprobante_compra", [
+        ("id_pago_en_comprobante_compra", "integer"), ("fk_id_pago", "integer"),
+        ("fk_id_comprobante_compra", "integer"), ("imp_pago_en_comprobante_compra", "double precision"),
+        ("imp_neto_pago_en_comprobante_compra", "double precision"), ("es_saldo_pago_anterior", "boolean"),
+    ]),
+    ("notas_creditos_compras_en_pagos", "id_nota_credito_compra_en_pago", [
+        ("id_nota_credito_compra_en_pago", "integer"), ("fk_id_pago", "integer"),
+        ("fk_id_comprobante_compra", "integer"),
+    ]),
+    ("ajustes_cuenta_corriente_proveedores", "id_ajuste_cuenta_corriente_proveedor", [
+        ("id_ajuste_cuenta_corriente_proveedor", "integer"), ("fk_id_proveedor", "integer"),
+        ("fec_ajuste_cuenta_corriente_proveedor", "timestamp"),
+        ("imp_ajuste_cuenta_corriente_proveedor", "double precision"),
+        ("es_ctacte", "boolean"),
+    ]),
+    ("pagos_en_ajustes_cuenta_corriente_proveedores", "id_pago_en_ajuste_cuenta_corriente_proveedor", [
+        ("id_pago_en_ajuste_cuenta_corriente_proveedor", "integer"), ("fk_id_pago", "integer"),
+        ("fk_id_ajuste_cuenta_corriente_proveedor", "integer"),
+        ("imp_pago_en_ajuste_cuenta_corriente_proveedor", "double precision"),
+        ("es_saldo_pago_anterior", "boolean"),
+    ]),
+    ("cheques", "id_cheque", [
+        ("id_cheque", "integer"), ("nro_cheque", "text"), ("fk_id_banco", "integer"),
+        ("imp_cheque", "double precision"), ("fec_ven_cheque", "date"), ("fec_ent_cheque", "date"),
+        ("estado_cheque", "text"), ("tipo_cheque", "text"), ("fec_dep_cheque", "date"),
+        ("fec_rech_cheque", "date"),
+    ]),
+    ("cheques_en_pagos", "id_cheque_en_pago", [
+        ("id_cheque_en_pago", "integer"), ("fk_id_pago", "integer"), ("fk_id_cheque", "integer"),
+        ("fk_id_caja", "integer"),
+    ]),
+    ("cheques_en_recibos", "id_cheque_en_recibo", [
+        ("id_cheque_en_recibo", "integer"), ("fk_id_recibo", "integer"), ("fk_id_cheque", "integer"),
+        ("fk_id_caja", "integer"),
+    ]),
+    ("recibos", "id_recibo", [
+        ("id_recibo", "integer"), ("fec_recibo", "timestamp"), ("fk_id_cliente", "integer"),
+        ("fk_id_tipo_recibo", "integer"), ("es_anulado", "boolean"),
+    ]),
+    ("cheques_propios", "id_cheque_propio", [
+        ("id_cheque_propio", "integer"), ("fk_id_cuenta_bancaria", "integer"),
+        ("imp_cheque_propio", "double precision"), ("fec_ven_cheque_propio", "date"),
+        ("fec_ent_cheque_propio", "date"), ("estado_cheque_propio", "text"), ("tipo_cheque_propio", "text"),
+    ]),
+    ("cheques_propios_en_pagos", "id_cheque_propio_en_pago", [
+        ("id_cheque_propio_en_pago", "integer"), ("fk_id_pago", "integer"),
+        ("fk_id_cheque_propio", "integer"), ("fk_id_caja", "integer"),
+    ]),
+    ("efectivo_medio_de_pago", "id_efectivo_medio_de_pago", [
+        ("id_efectivo_medio_de_pago", "integer"), ("imp_efectivo_medio_de_pago", "double precision"),
+        ("imp_equivalente_peso", "double precision"), ("fk_id_moneda", "integer"), ("fecha", "timestamp"),
+        ("fk_id_caja", "integer"),
+    ]),
+    ("efectivo_medio_de_pago_en_pagos", "id_efectivo_medio_de_pago_en_pago", [
+        ("id_efectivo_medio_de_pago_en_pago", "integer"), ("fk_id_pago", "integer"),
+        ("fk_id_efectivo_medio_de_pago", "integer"), ("fk_id_caja", "integer"),
+    ]),
+    ("movimientos_cuentas_bancarias", "id_movimiento_cuenta_bancaria", [
+        ("id_movimiento_cuenta_bancaria", "integer"), ("fk_id_cuenta_bancaria", "integer"),
+        ("imp_movimiento_cuenta_bancaria", "double precision"),
+        ("fec_movimiento_cuenta_bancaria", "timestamp"), ("tipo_movimiento_cuenta_bancaria", "text"),
+        ("fk_id_plan_de_cuenta", "integer"),
+    ]),
+    ("movimientos_cuenta_bancaria_en_pagos", "id_movimiento_cuenta_bancaria_en_pago", [
+        ("id_movimiento_cuenta_bancaria_en_pago", "integer"), ("fk_id_pago", "integer"),
+        ("fk_id_movimiento_cuenta_bancaria", "integer"), ("fk_id_caja", "integer"),
+    ]),
+    ("otro_medio_de_pago", "id_otro_medio_de_pago", [
+        ("id_otro_medio_de_pago", "integer"), ("des_otro_medio_de_pago", "text"),
+        ("imp_otro_medio_de_pago", "double precision"),
+    ]),
+    ("otro_medio_de_pago_en_pagos", "id_otro_medio_de_pago_en_pago", [
+        ("id_otro_medio_de_pago_en_pago", "integer"), ("fk_id_pago", "integer"),
+        ("fk_id_otro_medio_de_pago", "integer"), ("fk_id_caja", "integer"),
+    ]),
+    ("movimientos_fondos_categorias", "id_movimiento_fondo_categoria", [
+        ("id_movimiento_fondo_categoria", "integer"), ("des_movimiento_fondo_categoria", "text"),
+        ("des_grupo_estado_resultado", "text"), ("orden_grupo_estado_resultado", "integer"),
+    ]),
+    ("movimientos_fondos_tipos", "id_movimiento_fondo_tipo", [
+        ("id_movimiento_fondo_tipo", "integer"), ("des_movimiento_fondo_tipo", "text"),
+        ("es_ingreso", "boolean"), ("es_egreso", "boolean"), ("fk_id_movimiento_fondo_categoria", "integer"),
+        ("genera_asiento", "boolean"), ("fk_id_plan_de_cuenta", "integer"),
+    ]),
+    ("movimientos_fondos", "id_movimiento_fondo", [
+        ("id_movimiento_fondo", "integer"), ("fk_id_movimiento_fondo_tipo", "integer"),
+        ("fec_movimiento_fondo", "timestamp"), ("fk_id_caja", "integer"), ("es_ingreso", "boolean"),
+        ("es_egreso", "boolean"), ("des_movimiento_fondo", "text"), ("es_ctacte", "boolean"),
+        ("genera_ctacte", "boolean"), ("fec_carga_movimiento_fondo", "timestamp"),
+    ]),
+    ("efectivo_medio_de_pago_en_movimientos_fondos", "id_efectivo_medio_de_pago_en_movimiento_fondo", [
+        ("id_efectivo_medio_de_pago_en_movimiento_fondo", "integer"), ("fk_id_movimiento_fondo", "integer"),
+        ("fk_id_efectivo_medio_de_pago", "integer"), ("fk_id_caja", "integer"),
+    ]),
+    ("movimientos_cuenta_bancaria_en_movimientos_fondos", "id_movimiento_cuenta_bancaria_en_movimiento_fondo", [
+        ("id_movimiento_cuenta_bancaria_en_movimiento_fondo", "integer"),
+        ("fk_id_movimiento_fondo", "integer"), ("fk_id_movimiento_cuenta_bancaria", "integer"),
+        ("fk_id_caja", "integer"),
+    ]),
+    ("otro_medio_de_pago_en_movimientos_fondos", "id_otro_medio_de_pago_en_movimiento_fondo", [
+        ("id_otro_medio_de_pago_en_movimiento_fondo", "integer"), ("fk_id_movimiento_fondo", "integer"),
+        ("fk_id_otro_medio_de_pago", "integer"), ("fk_id_caja", "integer"),
+    ]),
 ]
 
 ARCHIVO_CONFIG = ".env.garro-sync"
@@ -256,6 +387,8 @@ class Corrida:
         self.etapa = "config"
         self.inicio = datetime.now(timezone.utc)
         self.filas: dict[str, int] = {}
+        # Medios de pago que todavía no se copian y que en Garro empezaron a usarse (ver SIN_COPIAR).
+        self.sin_copiar: dict[str, int] = {}
         self.pedido_tomado = False
         self.pedido_id: int | None = None
 
@@ -313,7 +446,7 @@ def decir(texto: str = "") -> None:
 
 
 def ddl() -> str:
-    """SQL de las tablas espejo (migraciones 329 + 350)."""
+    """SQL de las tablas espejo (migraciones 329 + 350 + 372)."""
     partes = []
     for nombre, pk, columnas in TABLAS:
         cols = ",\n  ".join(f"{c} {t}" + (" PRIMARY KEY" if c == pk else "") for c, t in columnas)
@@ -599,10 +732,49 @@ def leer_origen(cfg: dict[str, str], corrida: Corrida, latido=None) -> dict[str,
                 corrida.filas[nombre] = contar_filas(datos[nombre])
                 if latido:
                     latido()
+            corrida.sin_copiar = contar_sin_copiar(cur)
         origen.rollback()
     finally:
         origen.close()
     return datos
+
+
+# Tablas con importes (medios de pago, retenciones, percepciones) que el 27/10/2026 estaban vacías, así que no se
+# copian. Si alguno empieza a usarse, el importe de esos pagos o gastos faltaría en silencio en Supabase (saldo de
+# proveedores inflado, gasto sin monto): la guardia lo frena hasta que se sumen a TABLAS con su migración.
+SIN_COPIAR = (
+    "cheques_en_movimientos_fondos", "cheques_propios_en_movimientos_fondos", "efectivo_deposito_bancario_en_pagos",
+    "movimientos_billetera_virtual_en_pagos", "movimientos_billetera_virtual_en_movimientos_fondos",
+    "movimientos_tarjeta_credito_en_movimientos_fondos", "tarjetas_creditos_propias_en_pagos",
+    "tarjetas_creditos_propias_en_movimientos_fondos",
+    # Retenciones de Ganancias en pagos, percepciones de las compras y aplicación de saldos a cuenta: cambian el
+    # saldo de un proveedor y el 27/10/2026 estaban vacías.
+    "retenciones_ganancias", "regimenes_especiales_x_comprobantes_compras", "pagos_saldos_sin_imputar_en_pago",
+)
+
+
+def contar_sin_copiar(cur) -> dict[str, int]:
+    """Filas de las tablas de SIN_COPIAR que existen en el origen y ya no están vacías."""
+    cur.execute("""SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                   WHERE n.nspname = 'public' AND c.relkind = 'r' AND c.relname = ANY(%s)""", (list(SIN_COPIAR),))
+    existentes = [r[0] for r in cur.fetchall() if r[0] in SIN_COPIAR]
+    usadas: dict[str, int] = {}
+    for nombre in existentes:  # nombres fijos de SIN_COPIAR: no vienen de afuera
+        cur.execute(f'SELECT count(*) FROM public."{nombre}"')
+        n = int(cur.fetchone()[0])
+        if n > 0:
+            usadas[nombre] = n
+    return usadas
+
+
+def validar_sin_copiar(sin_copiar: dict[str, int], forzar: bool) -> None:
+    if forzar or not sin_copiar:
+        return
+    raise ErrorGuardia(
+        "En Gestión Integral se empezó a usar un medio de pago que la copia todavía no trae ("
+        + ", ".join(f"{t}: {n}" for t, n in sorted(sin_copiar.items()))
+        + "). Para no dejar pagos o gastos sin su importe, no se publicó nada y sigue la copia anterior. "
+        "Avisá a Alexander: hay que sumar esa tabla a la copia (se puede forzar a mano con --forzar).")
 
 
 def mostrar_filas(corrida: Corrida) -> int:
@@ -620,6 +792,8 @@ OBLIGATORIAS = (
     "tipos_comprobantes_ventas", "tipos_comprobantes_compras", "tipos_iva", "monedas",
     "clientes", "proveedores", "comprobantes_ventas", "items_comprobantes_ventas",
     "comprobantes_compras", "items_comprobantes_compras", "productos",
+    # mig 372: sin pagos el saldo de cada proveedor saldría inflado (todo «adeudado»).
+    "pagos", "cheques", "movimientos_fondos",
 )
 # Comprobantes e ítems casi nunca bajan (una anulación no borra filas): tolerancia chica.
 ESTRICTAS = ("comprobantes_ventas", "items_comprobantes_ventas",
@@ -686,6 +860,9 @@ def leer_previas(cur) -> dict[str, int] | None:
 def correr_prueba(cfg: dict[str, str], corrida: Corrida) -> None:
     datos = leer_origen(cfg, corrida)
     mostrar_filas(corrida)
+    if corrida.sin_copiar:
+        decir("ATENCIÓN: medios de pago en uso que la copia no trae: "
+              + ", ".join(f"{t} ({n})" for t, n in sorted(corrida.sin_copiar.items())) + ". La copia real va a frenar.")
     # Muestra para revisar acentos a ojo («Nota Débito» tiene que verse bien).
     muestra = datos["tipos_comprobantes_ventas"].getvalue().splitlines()[:8]
     decir("Muestra de tipos de comprobante de venta:")
@@ -759,6 +936,7 @@ def correr_copia(cfg: dict[str, str], corrida: Corrida, forzar: bool = False, so
 
             # Guardia: se valida la foto contra la última copia ok ANTES de vaciar nada.
             corrida.etapa = "destino"
+            validar_sin_copiar(corrida.sin_copiar, forzar)
             validar_foto(corrida.filas, leer_previas(cur), forzar)
 
             corrida.etapa = "copia"
