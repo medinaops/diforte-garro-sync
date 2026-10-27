@@ -5,3 +5,4 @@ __pycache__/
 .pytest_cache/
 version.txt
 relevamiento/
+.clave-relevamiento

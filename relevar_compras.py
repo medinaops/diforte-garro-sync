@@ -17,7 +17,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import secrets
 import sys
+import tempfile
 from datetime import datetime
 
 AQUI = os.path.dirname(os.path.abspath(__file__))
@@ -57,13 +59,101 @@ BAJAR_DESDE_ARRIBA = {"pagos", "movimientos_fondos", "movimientos_caja", "cheque
                       "movimientos_billeteras_virtuales", "otro_medio_de_pago"}
 POR_GRUPO_PAGOS = 3
 ULTIMOS_PAGOS = 20
-# Números de cuenta, CBU y CUIT de firmantes de cheques: solo los últimos 4 caracteres.
-PARCIALES = ("nro_cuenta", "cbu", "alias", "cuit_cheque")
-# Datos personales de terceros (firmantes de cheques, contactos): no salen.
-PERSONALES = ("dir_", "cp_", "loc_", "tel", "mail", "email", "domicilio", "celular", "des_cheque_de_tercero")
-# Clave del hash de las columnas sensibles: sale de la contraseña de la base, que nunca se exporta. Así una foto
-# no trae un MD5 de una contraseña o un token que se pueda atacar por diccionario.
+# Números de cuenta, tarjeta y CBU: solo los últimos 4 caracteres.
+PARCIALES = ("nro_cuenta", "numero_cuenta", "nro_tarjeta", "numero_tarjeta", "cbu", "cvu", "alias")
+# CUIT y documentos de proveedores, clientes y firmantes: solo los últimos 4.
+PARCIALES_EXACTAS = {"cuit_proveedor", "doc_cliente", "cuit_cheque_de_tercero", "cbu_proveedor", "cbu_doc_proveedor",
+                     "cuit_empresa", "cuit_cliente"}
+# Tablas de personas: solo salen las columnas que empiezan con estos prefijos (lista permitida, no de exclusión);
+# el resto (domicilio, contactos, nombres de particulares, observaciones) queda <omitido>.
+PERMITIDAS = {
+    "proveedores": ("id_", "fk_id_", "es_", "raz_soc_", "nom_fan_", "porc", "fec_ing_", "genera_", "incluir_"),
+    "clientes": ("id_", "fk_id_", "es_", "porc", "fec_ing_", "limite_credito", "bloquear_", "no_inlcuir"),
+    "operarios": ("id_", "fk_id_", "permitir_", "limitar_", "mostrar_", "habilitado", "nro_sucursal", "agregar_",
+                  "imprimir_", "utilizar_"),
+    "cheques_de_terceros": ("id_", "fk_id_"),
+}
+# Familias de tablas que no hacen al relevamiento de compras y pagos y guardan datos de clientes, destinatarios,
+# choferes o configuración: `comparar` solo cuenta sus cambios y las muestras no entran en ellas.
+SIN_DETALLE = ("client", "venta", "recibo", "presupuesto", "remitos_transito", "garantia", "reparto", "configuracion",
+               "transporte", "viajante", "operario", "usuario", "tickets_de_acceso", "pedido", "proyecto", "carrito",
+               "demanda", "ordenes_de_compra")
+
+
+# Solo se vuelcan filas de las tablas del circuito de compras, pagos, caja y contabilidad (lista permitida):
+# una tabla que no coincide con ninguna de estas partes, o que coincide con SIN_DETALLE, solo se cuenta.
+CON_DETALLE = ("compra", "pago", "cheque", "caja", "fondo", "asiento", "producto", "stock", "concepto", "regimen",
+               "percepcion", "retencion", "logs_sistema", "moneda", "efectivo", "tarjeta", "billetera", "cuenta",
+               "banc", "proveedor", "alicuota", "impuesto", "planes_de_cuentas", "deposito", "remito", "iva")
+
+
+def con_detalle(tabla: str) -> bool:
+    return (tabla not in TABLAS_SECRETAS and not any(p in tabla for p in SIN_DETALLE)
+            and any(p in tabla for p in CON_DETALLE))
+
+
+# Tablas auxiliares de personas (clientes_domicilios, clientes_contactos, proveedores_viajantes...): idem.
+PERMITIDAS_AUXILIARES = ("id_", "fk_id_", "es_", "fec_", "predeterminado", "porc", "imp_")
+# Datos personales de terceros (firmantes de cheques, contactos) y códigos de tarjeta: no salen.
+PERSONALES_PREFIJO = ("dir_", "cp_", "loc_", "tel", "equipo_")
+# logs_sistema guarda entidades distintas con el mismo fk_id_tipo: solo salen los logs de estos tipos (el resto de
+# los cambios en logs, como clientes, ventas o usuarios, se cuenta pero no se vuelca).
+LOGS_PERMITIDOS = ("ComprobanteCompra", "Pago", "MovimientoFondo", "AjusteCtaCteProveedor", "Producto")
+PERSONALES = ("domicilio", "direccion", "mail", "correo", "smtp", "telefono", "celular", "firmante", "des_cheque_de_tercero",
+              "cvv", "cvc", "cod_seguridad", "codigo_seguridad", "venc_tarjeta", "vencimiento_tarjeta")
+# En las tablas cuyo nombre contiene estas partes (cuentas, tarjetas, billeteras y todo lo que las vincula),
+# los números (nro_*, numero*, cbte_*) quedan con los últimos 4 y las observaciones (obs_*), texto libre donde
+# puede haber un alias, un titular o un número, no salen.
+FAMILIAS_CON_NUMEROS = ("tarjeta", "billetera", "cuenta_bancaria", "cuentas_bancarias")
+
+
+def permitidas(tabla: str | None) -> tuple | None:
+    """Prefijos de columna permitidos si la tabla es de personas; None si rige la regla general."""
+    if tabla is None:
+        return None
+    if tabla in PERMITIDAS:
+        return PERMITIDAS[tabla]
+    if tabla.startswith(("clientes_", "proveedores_")):
+        return PERMITIDAS_AUXILIARES
+    return None
+
+
+def con_numeros(tabla: str | None) -> bool:
+    return tabla is not None and any(p in tabla for p in FAMILIAS_CON_NUMEROS)
+
+
+# Clave de los hashes de las fotos: aleatoria, generada la primera vez y guardada al lado del script (fuera de
+# `relevamiento\`, que es lo que se comparte). No sale de ninguna contraseña: una foto no sirve para probar
+# contraseñas ni filas candidatas.
+ARCHIVO_CLAVE = os.path.join(AQUI, ".clave-relevamiento")
+VERSION_HASH = 2
 SAL: str | None = None
+
+
+def clave_local() -> str:
+    if not os.path.exists(ARCHIVO_CLAVE):
+        # Se escribe completa en un temporal y se publica con os.link, que falla si ya existe: si dos corridas
+        # arrancan juntas, gana una y la otra lee esa misma clave, nunca un archivo a medio escribir.
+        fd, temporal = tempfile.mkstemp(dir=AQUI, prefix=".clave-", suffix=".tmp")  # 0600, nombre impredecible
+        with os.fdopen(fd, "w", encoding="ascii") as f:
+            f.write(secrets.token_hex(32))
+        try:
+            os.link(temporal, ARCHIVO_CLAVE)
+        except FileExistsError:
+            pass
+        finally:
+            os.remove(temporal)
+    with open(ARCHIVO_CLAVE, encoding="ascii") as f:
+        clave = f.read().strip()
+    if len(clave) != 64 or any(c not in "0123456789abcdef" for c in clave):
+        raise SystemExit(f"{ARCHIVO_CLAVE} está dañado: borralo y sacá una foto nueva.")
+    return clave
+
+
+def id_clave() -> str:
+    """Identifica la clave sin revelarla: dos fotos con distinto id no se pueden comparar."""
+    assert SAL
+    return hashlib.sha256(("id|" + SAL).encode()).hexdigest()[:12]
 PROFUNDIDAD = 3
 POR_TIPO_ACTIVOS = 3
 POR_TIPO_OTROS = 1
@@ -78,17 +168,31 @@ def es_sensible(columna: str) -> bool:
     return c in SENSIBLES_EXACTAS or any(s in c for s in SENSIBLES) or c.startswith("imagen")
 
 
-def es_personal(columna: str) -> bool:
+def es_omitido(columna: str, tabla: str | None = None) -> bool:
     c = columna.lower()
-    return c.startswith(PERSONALES) or any(p in c for p in PARCIALES)
+    lista = permitidas(tabla)
+    if lista is not None:
+        return c not in PARCIALES_EXACTAS and not c.startswith(lista)
+    return (es_sensible(c) or c.startswith(PERSONALES_PREFIJO) or any(p in c for p in PERSONALES)
+            or (con_numeros(tabla) and c.startswith("obs_")))
 
 
-def limpiar(fila: dict) -> dict:
+def es_parcial(columna: str, tabla: str | None = None) -> bool:
+    c = columna.lower()
+    return (c in PARCIALES_EXACTAS or any(p in c for p in PARCIALES)
+            or (con_numeros(tabla) and c.startswith(("nro_", "numero", "cbte_"))))
+
+
+def es_personal(columna: str, tabla: str | None = None) -> bool:
+    return es_omitido(columna, tabla) or es_parcial(columna, tabla)
+
+
+def limpiar(fila: dict, tabla: str | None = None) -> dict:
     out = {}
     for k, v in fila.items():
-        if es_sensible(k) or k.lower().startswith(PERSONALES):
+        if es_omitido(k, tabla):
             out[k] = "<omitido>"
-        elif v is not None and any(p in k.lower() for p in PARCIALES):
+        elif v is not None and not isinstance(v, bool) and es_parcial(k, tabla):
             out[k] = "…" + str(v)[-4:]
         else:
             out[k] = v
@@ -106,9 +210,7 @@ def guardar(nombre: str, datos) -> str:
 def conectar():
     global SAL
     cfg = garro_sync.leer_archivo(os.path.join(AQUI, garro_sync.ARCHIVO_CONFIG))
-    if not cfg.get("GARRO_PASSWORD"):
-        raise SystemExit("Falta GARRO_PASSWORD en .env.garro-sync")
-    SAL = hashlib.sha256(("relevamiento-garro|" + cfg["GARRO_PASSWORD"]).encode()).hexdigest()
+    SAL = clave_local()
     con = garro_sync.conectar_origen(cfg)  # ya deja la sesión readonly
     con.rollback()
     # Una sola foto coherente de toda la base, y nada de quedarse esperando locks del programa.
@@ -196,7 +298,7 @@ def catalogo(con) -> str:
         out["referencia"] = {}
         for t in REFERENCIA:
             if t in existentes:
-                out["referencia"][t] = [limpiar(r["r"]) for r in filas(
+                out["referencia"][t] = [limpiar(r["r"], t) for r in filas(
                     cur, sql.SQL("SELECT row_to_json(t) AS r FROM public.{} t").format(sql.Identifier(t)))]
         out["logs_tipos"] = filas(cur, """SELECT tipo_log_sistema, tipo_cbte_log_sistema, origen_log_sistema, count(*) AS n
                                           FROM logs_sistema GROUP BY 1, 2, 3 ORDER BY 4 DESC""")
@@ -234,7 +336,7 @@ def muestras(cur, existentes: set[str]) -> dict:
     for _ in range(PROFUNDIDAD + 1):
         nuevo: dict[str, set] = {}
         for tabla, ids in frente.items():
-            if not ids or tabla not in existentes:
+            if not ids or tabla not in existentes or not con_detalle(tabla):
                 continue
             cols = pk.get(tabla)
             if not cols or len(cols) != 1:
@@ -243,9 +345,9 @@ def muestras(cur, existentes: set[str]) -> dict:
                 sql.Identifier(tabla), sql.Identifier(cols[0])), (list(ids),))
             destino = juntado.setdefault(tabla, {})
             for f in filas_t:
-                destino[str(f["r"][cols[0]])] = limpiar(f["r"])
+                destino[str(f["r"][cols[0]])] = limpiar(f["r"], tabla)
             for hija, col in hijos.get(cols[0], []):
-                if hija not in existentes or not pk.get(hija) or len(pk[hija]) != 1:
+                if hija not in existentes or not con_detalle(hija) or not pk.get(hija) or len(pk[hija]) != 1:
                     continue
                 cur.execute(sql.SQL("SELECT t.{} FROM public.{} t WHERE t.{} = ANY(%s)").format(
                     sql.Identifier(pk[hija][0]), sql.Identifier(hija), sql.Identifier(col)), (list(ids),))
@@ -262,7 +364,7 @@ def muestras(cur, existentes: set[str]) -> dict:
         fk = "fk_" + cols[0]
         ids = {f[fk] for t, v in juntado.items() for f in v.values() if f.get(fk) is not None}
         if ids:
-            juntado.setdefault(padre, {}).update({str(r["r"][cols[0]]): limpiar(r["r"]) for r in filas(
+            juntado.setdefault(padre, {}).update({str(r["r"][cols[0]]): limpiar(r["r"], padre) for r in filas(
                 cur, sql.SQL("SELECT row_to_json(t) AS r FROM public.{} t WHERE t.{} = ANY(%s)").format(
                     sql.Identifier(padre), sql.Identifier(cols[0])), (list(ids),))})
     # Historial de costo de esos productos: si el programa lo escribe al guardar la compra, se ve acá.
@@ -270,9 +372,9 @@ def muestras(cur, existentes: set[str]) -> dict:
     if ids_prod and "productos_costos" in existentes:
         juntado["productos_costos"] = {str(i): limpiar(r["r"]) for i, r in enumerate(filas(
             cur, "SELECT row_to_json(t) AS r FROM productos_costos t WHERE fk_id_producto = ANY(%s)", (ids_prod,)))}
-    # Logs: fk_id_tipo no sigue la convención de nombres. Las filas traen tipo_cbte/origen para filtrar las ajenas.
-    juntado["logs_sistema_por_fk_id_tipo"] = {
-        str(i): limpiar(r["r"]) for i, r in enumerate(filas(cur, "SELECT row_to_json(t) AS r FROM logs_sistema t WHERE fk_id_tipo = ANY(%s)", (raiz,)))}
+    # Logs: fk_id_tipo no sigue la convención de nombres y es el id de entidades distintas: se filtra por tipo.
+    juntado["logs_sistema_por_fk_id_tipo"] = {str(i): limpiar(r["r"], "logs_sistema") for i, r in enumerate(
+        logs_de(cur, "ComprobanteCompra", raiz))}
     return {"comprobantes": raiz, "filas": {t: list(v.values()) for t, v in juntado.items()}}
 
 
@@ -286,6 +388,13 @@ def claves_foraneas(cur) -> dict[tuple[str, str], str]:
                    JOIN pg_attribute a ON a.attrelid = k.conrelid AND a.attnum = k.conkey[1]
                    WHERE k.contype = 'f' AND n.nspname = 'public' AND array_length(k.conkey, 1) = 1""")
     return {(t, col): ref for t, col, ref in cur.fetchall()}
+
+
+def logs_de(cur, tipo_cbte: str, ids: list) -> list[dict]:
+    if not ids:
+        return []
+    return filas(cur, """SELECT row_to_json(t) AS r FROM logs_sistema t
+                         WHERE t.tipo_cbte_log_sistema = %s AND t.fk_id_tipo = ANY(%s)""", (tipo_cbte, list(ids)))
 
 
 def ids_de(cur, consulta: sql.Composable, params=None) -> list:
@@ -325,7 +434,7 @@ def juntar_pagos(cur, raices: dict[str, list], existentes: set[str]) -> dict:
         nuevo: dict[tuple[str, bool], set] = {}
         for (tabla, puede_bajar), ids in frente.items():
             cols = pk.get(tabla)
-            if tabla not in existentes or not cols or len(cols) != 1:
+            if tabla not in existentes or not con_detalle(tabla) or not cols or len(cols) != 1:
                 continue
             ya = juntado.setdefault(tabla, {})
             pedir = [i for i in ids if str(i) not in ya]
@@ -333,7 +442,7 @@ def juntar_pagos(cur, raices: dict[str, list], existentes: set[str]) -> dict:
                 for f in filas(cur, sql.SQL("SELECT row_to_json(t) AS r FROM public.{} t WHERE t.{} = ANY(%s)").format(
                         sql.Identifier(tabla), sql.Identifier(cols[0])), (pedir,)):
                     fila = f["r"]
-                    ya[str(fila[cols[0]])] = limpiar(fila)
+                    ya[str(fila[cols[0]])] = limpiar(fila, tabla)
                     for col, v in fila.items():  # hacia arriba
                         ref = fks.get((tabla, col))
                         if v is not None and ref in SUBIR_PAGOS and str(v) not in juntado.get(ref, {}):
@@ -378,7 +487,7 @@ def pagos(con) -> str:
             grupos = {}
             for c in cols:
                 nombre = c["columna"]
-                if t in TABLAS_SECRETAS or es_sensible(nombre) or es_personal(nombre):
+                if t in TABLAS_SECRETAS or es_personal(nombre, t):
                     continue
                 if (nombre.startswith(("estado", "tipo_", "es_", "fk_id_tipo", "fk_id_caja", "fk_id_moneda"))
                         or nombre in ("fk_id_movimiento_fondo_tipo", "fk_id_condicion_compra", "genera_cta_cte",
@@ -392,7 +501,7 @@ def pagos(con) -> str:
         out["referencia"] = {}
         for t in REFERENCIA_PAGOS:
             if t in existentes and t not in TABLAS_SECRETAS:
-                out["referencia"][t] = [limpiar(r["r"]) for r in filas(
+                out["referencia"][t] = [limpiar(r["r"], t) for r in filas(
                     cur, sql.SQL("SELECT row_to_json(t) AS r FROM public.{} t").format(sql.Identifier(t)))]
 
         def raiz(tabla: str, por: str | None, n: int = ULTIMOS_PAGOS) -> list:
@@ -412,6 +521,14 @@ def pagos(con) -> str:
         }
         out["raices"] = raices
         out["muestras"] = juntar_pagos(cur, raices, existentes)
+        # Logs de las entidades de la muestra, filtrados por tipo (fk_id_tipo se repite entre entidades).
+        if "logs_sistema" in existentes:
+            ids_por_tabla = {t: [f[pk[t][0]] for f in out["muestras"].get(t, [])] for t in
+                             ("pagos", "movimientos_fondos", "ajustes_cuenta_corriente_proveedores") if pk.get(t)}
+            out["muestras"]["logs_sistema"] = [limpiar(r["r"], "logs_sistema") for tipo, t in
+                                               (("Pago", "pagos"), ("MovimientoFondo", "movimientos_fondos"),
+                                                ("AjusteCtaCteProveedor", "ajustes_cuenta_corriente_proveedores"))
+                                               for r in logs_de(cur, tipo, ids_por_tabla.get(t, []))]
     con.rollback()
     return guardar(f"pagos-{ahora()}.json", out)
 
@@ -434,29 +551,23 @@ def columnas(cur) -> dict[str, list[str]]:
     return out
 
 
-def expr_hash(cols: list[str]) -> tuple[sql.Composable, list[str]]:
-    """md5 de la fila; las columnas sensibles entran solo como hash con clave (SAL), nunca crudas."""
-    sensibles = [c for c in cols if es_sensible(c) or es_personal(c)]
-    if not sensibles:
-        return sql.SQL("md5(t::text)"), []
+def expr_hash(cols: list[str], tabla: str | None = None) -> tuple[sql.Composable, list[str]]:
+    """md5 con clave (SAL) de la fila entera: una foto nunca trae un hash comparable de una fila cruda (contraseñas,
+    números de cuenta, datos de terceros). Mismo resultado para la misma fila dentro de una instalación."""
     assert SAL, "SAL sin inicializar: usar conectar()"
-    normales = [c for c in cols if c not in sensibles]
-    partes = [sql.SQL("ROW({})::text").format(sql.SQL(", ").join(sql.SQL("t.{}").format(sql.Identifier(c)) for c in normales))
-              if normales else sql.SQL("''")]
-    partes += [sql.SQL("md5(%s || coalesce(t.{}::text, ''))").format(sql.Identifier(c)) for c in sensibles]
-    return sql.SQL("md5({})").format(sql.SQL(" || ").join(partes)), [SAL] * len(sensibles)
+    return sql.SQL("md5(%s || t::text)"), [SAL]
 
 
 def tomar_foto(cur) -> dict:
     """Un hash por fila de cada tabla. Con PK: {pk: md5}. Sin PK: {md5: cuántas filas iguales}."""
-    foto: dict = {"generado": datetime.now().isoformat(), "tablas": {}}
+    foto: dict = {"generado": datetime.now().isoformat(), "version_hash": VERSION_HASH, "clave": id_clave(), "tablas": {}}
     pk = claves_primarias(cur)
     cols_por_tabla = columnas(cur)
     stats = {r["relname"]: r for r in filas(cur, """SELECT relname, n_tup_ins, n_tup_upd, n_tup_del
                                                      FROM pg_stat_user_tables WHERE schemaname = 'public'""")}
     for t in tablas(cur):
         cols = pk.get(t)
-        h, params = expr_hash(cols_por_tabla.get(t, []))
+        h, params = expr_hash(cols_por_tabla.get(t, []), t)
         filas_t: dict = {}
         if cols:
             cur.execute(sql.SQL("SELECT {}, {} FROM public.{} t").format(expr_pk(cols), h, sql.Identifier(t)), params)
@@ -496,6 +607,9 @@ def diferencia_tabla(a: dict, d: dict) -> dict:
 def comparar(con, ruta_antes: str) -> str:
     with open(ruta_antes, encoding="utf-8") as f:
         antes = json.load(f)
+    if antes.get("version_hash") != VERSION_HASH or antes.get("clave") != id_clave():
+        raise SystemExit(f"La foto {os.path.basename(ruta_antes)} es de otra versión del relevamiento (o de otra clave): "
+                         "no se puede comparar. Sacá una foto nueva antes de cargar el comprobante.")
     cambios: dict = {}
     # La foto nueva y el detalle salen de la MISMA transacción REPEATABLE READ: lo que se cuenta es lo que se vuelca.
     with con.cursor() as cur:
@@ -508,13 +622,18 @@ def comparar(con, ruta_antes: str) -> str:
                 continue
             item["stats_antes"] = (a or {}).get("stats")
             item["stats_despues"] = (d or {}).get("stats")
-            if d is not None and t not in TABLAS_SECRETAS:
+            if d is not None and con_detalle(t):
                 if item["pk"] and item["claves_alta_o_modif"]:
                     consulta = sql.SQL("SELECT row_to_json(t) AS r FROM public.{} t WHERE {} = ANY(%s)").format(
                         sql.Identifier(t), expr_pk(item["pk"]))
-                    item["filas_nuevas_o_modificadas"] = [limpiar(r["r"]) for r in filas(cur, consulta, (item["claves_alta_o_modif"],))]
+                    volcadas = [limpiar(r["r"], t) for r in filas(cur, consulta, (item["claves_alta_o_modif"],))]
+                    if t == "logs_sistema":
+                        ajenas = [f for f in volcadas if f.get("tipo_cbte_log_sistema") not in LOGS_PERMITIDOS]
+                        volcadas = [f for f in volcadas if f.get("tipo_cbte_log_sistema") in LOGS_PERMITIDOS]
+                        item["logs_de_otros_tipos"] = len(ajenas)
+                    item["filas_nuevas_o_modificadas"] = volcadas
                 elif not item["pk"] and item["hashes_alta"]:
-                    h, params = expr_hash(d.get("columnas", []))
+                    h, params = expr_hash(d.get("columnas", []), t)
                     consulta = sql.SQL("SELECT row_to_json(t) AS r, {} AS h FROM public.{} t WHERE {} = ANY(%s)").format(
                         h, sql.Identifier(t), h)
                     vistos: set = set()
@@ -522,9 +641,11 @@ def comparar(con, ruta_antes: str) -> str:
                     for r in filas(cur, consulta, params + params + [list(item["hashes_alta"])]):
                         if r["h"] not in vistos:  # una por hash; la cantidad está en hashes_alta
                             vistos.add(r["h"])
-                            item["filas_nuevas_o_modificadas"].append({"veces": item["hashes_alta"][r["h"]], **limpiar(r["r"])})
+                            item["filas_nuevas_o_modificadas"].append({"veces": item["hashes_alta"][r["h"]], **limpiar(r["r"], t)})
             elif t in TABLAS_SECRETAS:
                 item["filas_nuevas_o_modificadas"] = "<omitido: tabla con secretos>"
+            elif d is not None:
+                item["filas_nuevas_o_modificadas"] = "<omitido: clientes, ventas o configuración; solo se cuentan los cambios>"
             cambios[t] = item
     con.rollback()
     guardar(f"foto-{ahora()}.json", despues)
