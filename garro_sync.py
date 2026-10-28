@@ -23,7 +23,7 @@ puede escribir el error en Supabase, queda en `garro_sync.log`, al lado de este 
 Uso:
     python garro_sync.py               # copia completa
     python garro_sync.py --prueba      # lee el origen y cuenta filas, no escribe nada
-    python garro_sync.py --si-hay-pedido  # copia solo si alguien pidió «Actualizar ahora» (tarea de cada 5 min)
+    python garro_sync.py --si-hay-pedido  # copia solo si alguien pidió «Actualizar ahora» (tarea de cada 5 min; después hace una pasada del relevamiento automático)
     python garro_sync.py --prueba-destino # prueba la conexión segura y la contraseña de Supabase; no escribe nada
     python garro_sync.py --forzar      # copia saltando la guardia de la foto (solo uso manual)
     python garro_sync.py --ddl         # imprime el SQL de las tablas espejo (migs 329 + 350 + 372)
@@ -1050,7 +1050,33 @@ def correr_prueba_destino(cfg: dict[str, str]) -> bool:
 
 
 def correr_pedido(config: str) -> int:
-    """Modo de la tarea de cada 5 minutos: latido y, si hay un pedido, copia normal con la guardia."""
+    """Modo de la tarea de cada 5 minutos: latido y, si hay un pedido, copia normal con la guardia.
+
+    Pase lo que pase con el pedido, después hace una pasada del relevamiento automático (nunca cambia el resultado).
+    """
+    codigo = _atender_pedido(config)
+    relevamiento_auto(config)
+    return codigo
+
+
+def relevamiento_auto(config: str) -> None:
+    """Mejor esfuerzo: cualquier falla queda en el log y no toca el código de salida de la tarea."""
+    try:
+        cfg = leer_archivo(config)
+        if cfg.get("RELEVAMIENTO_AUTO", "1").strip() == "0":
+            return
+        import relevar_compras  # acá y no arriba: relevar_compras importa garro_sync
+        inicio = time.monotonic()
+        resultado = relevar_compras.auto(cfg)
+        if resultado in ("base_inicial", "base_reiniciada", "solo_local") or resultado.startswith("subido"):
+            segundos = int(time.monotonic() - inicio)
+            decir(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} (relevamiento) {resultado} ({segundos} s)")
+    except (Exception, SystemExit) as e:  # SystemExit: relevar_compras corta así si la clave está dañada
+        escribir_traza(limitar=True)
+        decir(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} (relevamiento) ERROR: {type(e).__name__}: {e}")
+
+
+def _atender_pedido(config: str) -> int:
     corrida = Corrida()
     cfg: dict[str, str] | None = None
     marca = datetime.now().strftime('%Y-%m-%d %H:%M:%S')

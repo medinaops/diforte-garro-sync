@@ -8,10 +8,13 @@ la variable DIFORTE_PRODUCCION o en una carpeta hermana; si no lo encuentran, se
 
 import glob
 import io
+import json
 import os
 import re
 import sys
 import tempfile
+import time
+import types
 import unittest
 from unittest import mock
 
@@ -836,6 +839,7 @@ class ModoPedido(unittest.TestCase):
             with mock.patch.object(g, "LOG_LOCAL", os.path.join(ruta_tmp, "log")), \
                     mock.patch.object(g, "leer_archivo", return_value=dict(CFG)), \
                     mock.patch.object(g, "leer_origen", side_effect=origen_falso(filas=filas)) as lo, \
+                    mock.patch.object(g, "relevamiento_auto"), \
                     mock.patch.object(g, "conectar_destino", side_effect=con):
                 codigo = g.main(argv or ["--si-hay-pedido", "--config", "x"])
             ruta = os.path.join(ruta_tmp, "log")
@@ -995,6 +999,7 @@ class ModoPedido(unittest.TestCase):
                 mock.patch.object(g, "LOG_LOCAL", os.path.join(tmp, "log")), \
                 mock.patch.object(g, "leer_archivo", return_value=dict(CFG)), \
                 mock.patch.object(g, "leer_origen", side_effect=origen_falso(filas=self.vacia())), \
+                mock.patch.object(g, "relevamiento_auto"), \
                 mock.patch.object(g, "conectar_destino", side_effect=abrir):
             g.main(["--si-hay-pedido", "--config", "x"])
         self.assertEqual(n[0], 4)  # latido, copia, fallo_pedido y registro de error
@@ -1125,6 +1130,412 @@ class LogRotativo(unittest.TestCase):
                 g.escribir_log("a")
                 g.escribir_log("b")
             self.assertFalse(os.path.exists(ruta + ".1"))
+
+
+# ---------------------------------------------------------------- relevamiento automático
+
+try:
+    import psycopg2  # noqa: F401
+except ImportError:  # estos tests no tocan una base: alcanza con que relevar_compras se pueda importar
+    _falso = mock.MagicMock()
+    sys.modules["psycopg2"], sys.modules["psycopg2.sql"] = _falso, _falso.sql
+import relevar_compras as rc  # noqa: E402
+
+REAL_LEER_CONTADORES = rc.leer_contadores
+REAL_ACOTAR = rc.acotar
+REAL_SUBIR = rc.subir
+
+
+def foto_falsa(generado, filas=None, clave="k", version=None):
+    return {"generado": generado, "version_hash": rc.VERSION_HASH if version is None else version, "clave": clave,
+            "tablas": {"comprobantes_compras": {"pk": ["id"], "columnas": ["id"], "filas": filas or {}, "stats": None}}}
+
+
+class ConexionAuto:
+    def __init__(self):
+        self.cur = mock.MagicMock()
+        self.cur.__enter__.return_value = self.cur
+        self.rollback, self.close, self.commit = mock.MagicMock(), mock.MagicMock(), mock.MagicMock()
+
+    def cursor(self):
+        return self.cur
+
+
+class RelevamientoAutomatico(unittest.TestCase):
+    CAMBIOS_COMPRAS = {"comprobantes_compras": {"altas": 1, "bajas": 0, "modificadas": 0,
+                                                "filas_nuevas_o_modificadas": [{"id": 1}]}}
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.contadores = {"comprobantes_compras": 10}
+        self.fotos = []  # una por llamada a tomar_foto
+        self.cambios = dict(self.CAMBIOS_COMPRAS)
+        self.error_subida = None
+        self.subidas = []
+        self.con = ConexionAuto()
+        self.mensajes = []
+
+        def tomar(cur):
+            f = foto_falsa(f"2026-10-27T10:0{len(self.fotos)}:00-03:00")
+            self.fotos.append(f)
+            return f
+
+        def subir(cfg, carga):
+            if self.error_subida:
+                raise self.error_subida
+            self.subidas.append(carga)
+
+        parches = [
+            mock.patch.object(rc, "SALIDA", self._tmp.name),
+            mock.patch.object(rc, "conectar", return_value=self.con),
+            mock.patch.object(rc, "leer_contadores", side_effect=lambda cur: dict(self.contadores)),
+            mock.patch.object(rc, "tomar_foto", side_effect=tomar),
+            mock.patch.object(rc, "calcular_cambios", side_effect=lambda cur, a, d: self.cambios),
+            mock.patch.object(rc, "id_clave", return_value="k"),
+            mock.patch.object(rc, "subir", side_effect=subir),
+            mock.patch.object(rc.garro_sync, "decir", side_effect=self.mensajes.append),
+        ]
+        for p in parches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def dir(self, cfg=None):
+        return rc.dir_auto(cfg or {})
+
+    def estado(self):
+        with open(os.path.join(self.dir(), "estado.json"), encoding="utf-8") as f:
+            return json.load(f)
+
+    def diferencias(self):
+        return glob.glob(os.path.join(self.dir(), "diferencia-*.json"))
+
+    def base_inicial(self):
+        self.assertEqual(rc.auto({}), "base_inicial")
+        rc.tomar_foto.reset_mock()
+
+    def test_primera_corrida_toma_la_base_y_no_sube(self):
+        self.assertEqual(rc.auto({}), "base_inicial")
+        self.assertEqual(self.subidas, [])
+        self.assertEqual(self.estado()["contadores"], self.contadores)
+        self.assertTrue(os.path.exists(os.path.join(self.dir(), self.estado()["foto"])))
+        self.con.close.assert_called_once()
+
+    def test_contadores_iguales_no_sacan_foto(self):
+        self.base_inicial()
+        self.assertEqual(rc.auto({}), "sin_cambios")
+        rc.tomar_foto.assert_not_called()
+        self.assertEqual(self.subidas, [])
+
+    def test_cambios_de_compras_suben_una_vez_y_avanzan_la_base(self):
+        self.base_inicial()
+        self.contadores = {"comprobantes_compras": 11}
+        self.assertEqual(rc.auto({}), "subido 1")
+        self.assertEqual(len(self.subidas), 1)
+        carga = self.subidas[0]
+        self.assertEqual(carga["antes"], "2026-10-27T10:00:00-03:00")
+        self.assertEqual(carga["despues"], "2026-10-27T10:01:00-03:00")
+        self.assertEqual(carga["cambios"], self.cambios)
+        self.assertEqual(self.estado()["contadores"], {"comprobantes_compras": 11})
+        self.assertEqual(len(self.diferencias()), 1)
+        self.assertEqual(rc.auto({}), "sin_cambios")  # la base avanzó
+        self.assertEqual(len(self.subidas), 1)
+        bases = [f for f in os.listdir(self.dir()) if f.startswith("base-")]
+        self.assertEqual(bases, [self.estado()["foto"]])
+
+    def test_subida_fallida_deja_la_diferencia_en_disco_y_avanza_la_base(self):
+        self.base_inicial()
+        self.contadores = {"comprobantes_compras": 11}
+        self.error_subida = ErrorPg("no existe la función", "42883")
+        self.assertEqual(rc.auto({}), "solo_local")
+        self.assertEqual(len(self.diferencias()), 1)
+        self.assertEqual(self.estado()["contadores"], {"comprobantes_compras": 11})
+        self.assertTrue(any("migración 373" in m for m in self.mensajes))
+        self.error_subida = OSError("red caída")
+        self.contadores = {"comprobantes_compras": 12}
+        with mock.patch.object(rc, "ahora", return_value="otro-instante"):  # nombres de diferencia distintos
+            self.assertEqual(rc.auto({}), "solo_local")
+        self.assertEqual(len(self.diferencias()), 2)
+
+    def test_sin_cambios_en_compras_avanza_la_base_sin_subir(self):
+        self.base_inicial()
+        self.contadores = {"comprobantes_compras": 11}
+        self.cambios = {"clientes": {"altas": 1, "bajas": 0, "modificadas": 0}}
+        self.assertEqual(rc.auto({}), "sin_cambios_compras")
+        self.assertEqual(self.subidas, [])
+        self.assertEqual(self.diferencias(), [])
+        self.assertEqual(self.estado()["contadores"], {"comprobantes_compras": 11})
+
+    def test_contador_que_baja_rehace_la_base_sin_subir(self):
+        self.base_inicial()
+        self.contadores = {"comprobantes_compras": 3}
+        self.assertEqual(rc.auto({}), "base_reiniciada")
+        rc.calcular_cambios.assert_not_called()
+        self.assertEqual(self.subidas, [])
+        self.assertEqual(self.estado()["contadores"], {"comprobantes_compras": 3})
+
+    def base_ajena(self, campo, valor):
+        self.base_inicial()
+        ruta = os.path.join(self.dir(), self.estado()["foto"])
+        with open(ruta, encoding="utf-8") as f:
+            base = json.load(f)
+        base[campo] = valor
+        with open(ruta, "w", encoding="utf-8") as f:
+            json.dump(base, f)
+        self.contadores = {"comprobantes_compras": 11}
+        self.assertEqual(rc.auto({}), "base_reiniciada")
+        self.assertEqual(self.subidas, [])
+        self.assertEqual(rc.auto({}), "sin_cambios")  # la base nueva ya es de esta versión
+
+    def test_base_de_otra_version_se_rehace_sin_subir(self):
+        self.base_ajena("version_hash", rc.VERSION_HASH + 1)
+
+    def test_base_de_otra_clave_se_rehace_sin_subir(self):
+        self.base_ajena("clave", "otra")
+
+    def test_con_el_candado_tomado_se_saltea_y_al_soltarlo_se_puede_volver_a_tomar(self):
+        os.makedirs(self.dir())
+        a = rc.tomar_lock({})
+        self.assertIsNotNone(a)
+        self.assertIsNone(rc.tomar_lock({}))  # otro descriptor abierto: conflicto real de flock
+        self.assertEqual(rc.auto({}), "ocupado")
+        rc.conectar.assert_not_called()
+        rc.soltar_lock(a)
+        self.assertEqual(rc.auto({}), "base_inicial")
+
+    def test_el_candado_se_libera_aunque_la_pasada_falle(self):
+        rc.leer_contadores.side_effect = RuntimeError("boom")
+        with self.assertRaises(RuntimeError):
+            rc.auto({})
+        otro = rc.tomar_lock({})
+        self.assertIsNotNone(otro)
+        rc.soltar_lock(otro)
+
+    def test_si_no_se_puede_guardar_el_estado_tras_subir_se_reintenta(self):
+        self.preparar_cambio()
+        with mock.patch.object(rc, "guardar_base", side_effect=OSError("permisos")):
+            self.assertEqual(rc.auto({}), "reintentar")
+        self.assertEqual(len(self.subidas), 1)
+        self.assertTrue(any("estado local" in m for m in self.mensajes))
+        self.assertEqual(self.estado()["contadores"], {"comprobantes_compras": 10})
+
+    def test_desactivado_no_conecta(self):
+        self.assertEqual(rc.auto({"RELEVAMIENTO_AUTO": "0"}), "desactivado")
+        rc.conectar.assert_not_called()
+
+    def test_carga_grande_se_recorta_por_las_tablas_mas_pesadas(self):
+        carga = {"antes": "a", "despues": "d", "cambios": {
+            "grande": {"filas_nuevas_o_modificadas": [{"x": "y" * 100}] * 50},
+            "chica": {"filas_nuevas_o_modificadas": [{"x": 1}]}}}
+        r = rc.acotar(carga, maximo=2000)
+        self.assertEqual(r["cambios"]["grande"]["filas_nuevas_o_modificadas"], "<recortado: 50 filas>")
+        self.assertEqual(r["cambios"]["chica"]["filas_nuevas_o_modificadas"], [{"x": 1}])
+        self.assertIsInstance(carga["cambios"]["grande"]["filas_nuevas_o_modificadas"], list)  # no muta la original
+
+    def test_la_diferencia_local_conserva_solo_las_ultimas_200(self):
+        os.makedirs(self.dir())
+        for i in range(205):
+            with open(os.path.join(self.dir(), f"diferencia-20260101-{i:06d}.json"), "w") as f:
+                f.write("{}")
+        rc.guardar_diferencia({}, {"antes": "a", "despues": "d", "cambios": {}})
+        self.assertEqual(len(self.diferencias()), rc.MAX_DIFERENCIAS_LOCALES)
+
+    def test_lo_que_se_sube_no_lleva_claves_ni_hashes_de_tablas_sin_detalle(self):
+        self.base_inicial()
+        self.contadores = {"comprobantes_compras": 11}
+        self.cambios = {
+            **self.CAMBIOS_COMPRAS,
+            "clientes": {"pk": ["id"], "altas": 1, "bajas": 1, "modificadas": 0, "claves_alta_o_modif": ["9"],
+                         "claves_borradas": ["8"], "filas_nuevas_o_modificadas": "<omitido: clientes>"},
+            "sin_pk_ventas": {"pk": None, "altas": 1, "bajas": 0, "modificadas": 0, "hashes_alta": {"abc": 1},
+                              "hashes_baja": {}},
+            "logs_sistema": {"pk": ["id"], "altas": 2, "bajas": 1, "modificadas": 0,
+                             "claves_alta_o_modif": ["1", "2"], "claves_borradas": ["7"],
+                             "hashes_alta": {"h1": 1}, "hashes_baja": {"h2": 1},
+                             "filas_nuevas_o_modificadas": [{"id": 1}]}}
+        self.assertEqual(rc.auto({}), "subido 2")
+        subido = self.subidas[0]["cambios"]
+        self.assertEqual(subido["clientes"]["altas"], 1)
+        for k in rc.CLAVES_DE_FILAS:
+            self.assertNotIn(k, subido["clientes"])
+            self.assertNotIn(k, subido["sin_pk_ventas"])
+        for k in rc.CLAVES_DE_FILAS:
+            self.assertNotIn(k, subido["logs_sistema"])
+        self.assertNotIn('"9"', json.dumps(subido["clientes"]))
+        with open(self.diferencias()[0], encoding="utf-8") as f:
+            self.assertNotIn("abc", f.read())
+        self.assertIn("claves_alta_o_modif", self.cambios["clientes"])  # lo calculado no se toca
+
+    def test_acotar_nunca_pasa_del_limite(self):
+        cambios = {"comprobantes_compras": {"altas": 1000, "bajas": 0, "modificadas": 0,
+                                            "claves_alta_o_modif": [str(i) for i in range(1000)],
+                                            "filas_nuevas_o_modificadas": [{"id": i} for i in range(1000)]}}
+        carga = {"antes": "a", "despues": "d", "cambios": cambios}
+        for limite in (2000, 400, 200):
+            r = rc.acotar(carga, maximo=limite)
+            self.assertLessEqual(len(json.dumps(r, default=str, ensure_ascii=False).encode()), limite)
+            self.assertEqual(r["cambios"]["comprobantes_compras"]["altas"], 1000)
+
+    def test_el_cfg_de_auto_es_el_que_conecta_al_origen(self):
+        cfg = {"GARRO_HOST": "otro"}
+        rc.auto(cfg)
+        rc.conectar.assert_called_once_with(cfg)
+
+    def test_la_subida_pone_un_tope_de_tiempo_a_la_sentencia(self):
+        con = ConexionAuto()
+        with mock.patch.object(rc.garro_sync, "conectar_destino", return_value=con):
+            REAL_SUBIR({}, {"antes": "a", "despues": "d", "cambios": {}})
+        sqls = [c[0][0] for c in con.cur.execute.call_args_list]
+        self.assertIn("statement_timeout", sqls[0])
+        self.assertIn("subir_relevamiento", sqls[1])
+
+    def test_leer_contadores_castea_a_text_y_no_usa_productos(self):
+        cur = mock.MagicMock()
+        cur.fetchall.return_value = [("pagos", 5)]
+        self.assertEqual(REAL_LEER_CONTADORES(cur), {"pagos": 5})
+        self.assertIn("relname::text = ANY(%s::text[])", cur.execute.call_args[0][0])
+        self.assertNotIn("productos", rc.DISPARADORES)
+
+    def test_cada_origen_tiene_su_propia_base(self):
+        a, b = {"GARRO_HOST": "a", "GARRO_PUERTO": "1", "GARRO_BASE": "x"}, {"GARRO_HOST": "b", "GARRO_PUERTO": "1", "GARRO_BASE": "x"}
+        self.assertEqual(rc.auto(a), "base_inicial")
+        self.contadores = {"comprobantes_compras": 99}
+        self.assertEqual(rc.auto(b), "base_inicial")  # nunca se compara A contra B
+        self.assertEqual(self.subidas, [])
+        self.assertNotEqual(self.dir(a), self.dir(b))
+        self.contadores = {"comprobantes_compras": 10}
+        self.assertEqual(rc.auto(a), "sin_cambios")  # volvió a ver la base de A
+
+    def test_si_ni_los_conteos_entran_queda_en_disco_y_la_base_avanza(self):
+        self.base_inicial()
+        self.contadores = {"comprobantes_compras": 11}
+        self.cambios = {"comprobantes_compras": {"altas": 1, "bajas": 0, "modificadas": 0,
+                                                 "filas_nuevas_o_modificadas": [{"id": 1}]},
+                        **{"tabla_con_nombre_largo_" + "x" * 50 + str(i): {"altas": 1, "bajas": 0, "modificadas": 0}
+                           for i in range(10)}}
+        with mock.patch.object(rc, "acotar", side_effect=lambda c: REAL_ACOTAR(c, 100)):
+            self.assertEqual(rc.auto({}), "solo_local")
+        self.assertEqual(self.subidas, [])
+        self.assertEqual(len(self.diferencias()), 1)
+        self.assertEqual(self.estado()["contadores"], {"comprobantes_compras": 11})
+        self.assertTrue(any("no entra" in m for m in self.mensajes))
+
+    def test_acotar_levanta_si_no_hay_forma_de_entrar(self):
+        carga = {"antes": "a", "despues": "d", "cambios": {"t" * 60 + str(i): {"altas": 1} for i in range(10)}}
+        with self.assertRaises(rc.DiferenciaDemasiadoGrande):
+            rc.acotar(carga, maximo=100)
+
+    def preparar_cambio(self):
+        self.base_inicial()
+        self.contadores = {"comprobantes_compras": 11}
+
+    def test_sin_disco_pero_con_subida_igual_avanza(self):
+        self.preparar_cambio()
+        with mock.patch.object(rc, "guardar_diferencia", side_effect=OSError("disco lleno")):
+            self.assertEqual(rc.auto({}), "subido 1")
+        self.assertEqual(len(self.subidas), 1)
+        self.assertEqual(self.estado()["contadores"], {"comprobantes_compras": 11})
+        self.assertTrue(any("no se pudo guardar" in m.lower() for m in self.mensajes))
+
+    def test_sin_disco_y_sin_subida_no_avanza_la_base(self):
+        self.preparar_cambio()
+        self.error_subida = OSError("red caída")
+        with mock.patch.object(rc, "guardar_diferencia", side_effect=OSError("disco lleno")):
+            self.assertEqual(rc.auto({}), "reintentar")
+        self.assertEqual(self.estado()["contadores"], {"comprobantes_compras": 10})
+        self.assertFalse(any("queda guardada acá" in m for m in self.mensajes))
+        self.error_subida = None  # la próxima pasada recalcula desde la misma base
+        self.assertEqual(rc.auto({}), "subido 1")
+        self.assertEqual(self.subidas[0]["antes"], "2026-10-27T10:00:00-03:00")
+
+    def test_demasiado_grande_sin_disco_no_avanza(self):
+        self.preparar_cambio()
+        with mock.patch.object(rc, "acotar", side_effect=rc.DiferenciaDemasiadoGrande({"antes": "a", "despues": "d", "cambios": {}})), \
+                mock.patch.object(rc, "guardar_diferencia", side_effect=OSError("disco lleno")):
+            self.assertEqual(rc.auto({}), "reintentar")
+        self.assertEqual(self.subidas, [])
+        self.assertEqual(self.estado()["contadores"], {"comprobantes_compras": 10})
+
+    def test_pasada_demasiado_larga_corta_sin_tocar_el_estado_y_suelta_el_candado(self):
+        self.preparar_cambio()
+        reloj = iter([0, 0, 10, 10 + rc.LIMITE_CORRIDA_SEGUNDOS + 1, 99999, 99999])
+
+        def tomar_lento(cur):
+            rc.controlar_plazo()  # primera tabla: dentro del plazo
+            rc.controlar_plazo()  # segunda: ya pasó
+            return foto_falsa("x")
+        with mock.patch.object(rc, "reloj", side_effect=lambda: next(reloj)), \
+                mock.patch.object(rc, "tomar_foto", side_effect=tomar_lento):
+            self.assertEqual(rc.auto({}), "demasiado_larga")
+        self.assertEqual(self.estado()["contadores"], {"comprobantes_compras": 10})
+        libre = rc.tomar_lock({})
+        self.assertIsNotNone(libre)  # el candado se soltó
+        rc.soltar_lock(libre)
+        self.assertIsNone(rc._plazo)
+        self.assertTrue(any("RELEVAMIENTO_AUTO=0" in m for m in self.mensajes))
+        rc.controlar_plazo()  # fuera del modo automático no hay plazo (foto/comparar a mano)
+
+    def test_una_excepcion_del_relevamiento_no_cambia_el_codigo_del_pedido(self):
+        for fallo in (RuntimeError("boom"), SystemExit("clave dañada")):
+            with self.subTest(fallo=repr(fallo)):
+                fake = types.ModuleType("relevar_compras")
+                fake.auto = mock.MagicMock(side_effect=fallo)
+                with tempfile.TemporaryDirectory() as tmp, \
+                        mock.patch.object(g, "LOG_LOCAL", os.path.join(tmp, "log")), \
+                        mock.patch.object(g, "leer_archivo", return_value=dict(CFG)), \
+                        mock.patch.object(g, "_atender_pedido", return_value=0), \
+                        mock.patch.dict(sys.modules, {"relevar_compras": fake}):
+                    self.assertEqual(g.correr_pedido("x"), 0)
+                    pass
+                self.assertTrue(any("(relevamiento) ERROR" in m for m in self.mensajes))
+        with mock.patch.object(g, "_atender_pedido", return_value=1), \
+                mock.patch.object(g, "relevamiento_auto") as ra:
+            self.assertEqual(g.correr_pedido("x"), 1)  # el código del pedido pasa tal cual
+            ra.assert_called_once_with("x")
+
+    def test_relevamiento_auto_desactivado_ni_importa_el_modulo(self):
+        fake = types.ModuleType("relevar_compras")
+        fake.auto = mock.MagicMock()
+        with mock.patch.object(g, "leer_archivo", return_value={"RELEVAMIENTO_AUTO": "0"}), \
+                mock.patch.dict(sys.modules, {"relevar_compras": fake}):
+            g.relevamiento_auto("x")
+        fake.auto.assert_not_called()
+
+
+
+class CompararComparteCalculo(unittest.TestCase):
+    def test_calcular_cambios_clasifica_altas_modificadas_y_bajas_y_redacta(self):
+        antes = foto_falsa("a", {"1": "h1", "2": "h2", "3": "h3"})
+        despues = foto_falsa("d", {"1": "h1", "2": "CAMBIO", "4": "h4"})
+        for foto in (antes, despues):  # una tabla sin detalle: solo se cuenta
+            foto["tablas"]["clientes"] = {"pk": ["id"], "columnas": ["id"], "filas": {}, "stats": None}
+        despues["tablas"]["clientes"]["filas"] = {"9": "x"}
+        volcadas = [{"id": 2, "clave_operario": "secreta"}, {"id": 4}]
+        with mock.patch.object(rc, "filas", return_value=[{"r": r} for r in volcadas]) as f:
+            cambios = rc.calcular_cambios(mock.MagicMock(), antes, despues)
+        t = cambios["comprobantes_compras"]
+        self.assertEqual((t["altas"], t["modificadas"], t["bajas"]), (1, 1, 1))
+        self.assertEqual(t["filas_nuevas_o_modificadas"][0]["clave_operario"], "<omitido>")
+        self.assertEqual(f.call_count, 1)  # clientes no consulta filas
+        self.assertTrue(cambios["clientes"]["filas_nuevas_o_modificadas"].startswith("<omitido"))
+        self.assertFalse(t["tabla_nueva"] or t["tabla_borrada"])
+
+    def test_comparar_escribe_los_mismos_archivos_con_la_misma_estructura(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(rc, "SALIDA", tmp), mock.patch.object(rc, "id_clave", return_value="k"), \
+                mock.patch.object(rc, "tomar_foto", return_value=foto_falsa("d", {"1": "h"})), \
+                mock.patch.object(rc, "calcular_cambios", return_value={"t": {"altas": 1, "bajas": 0, "modificadas": 0,
+                                                                             "tabla_nueva": False, "tabla_borrada": False}}):
+            antes = os.path.join(tmp, "foto-antes.json")
+            json.dump(foto_falsa("a"), open(antes, "w"))
+            con = ConexionAuto()
+            with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+                ruta = rc.comparar(con, antes)
+            datos = json.load(open(ruta, encoding="utf-8"))
+        self.assertEqual(set(datos), {"antes", "despues", "cambios"})
+        self.assertEqual(datos["antes"], antes)
+        self.assertIn("t: +1 altas, 0 modificadas, -0 bajas", out.getvalue())
+        con.rollback.assert_called_once()
 
 
 if __name__ == "__main__":

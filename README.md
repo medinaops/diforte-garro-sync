@@ -72,9 +72,9 @@ El relevamiento (`relevar_compras.py`) se corre igual, desde la carpeta de insta
 - **En la PC:** doble clic en **Actualizar Garro ahora** (escritorio). Corre la copia, muestra el resultado y espera una tecla.
 - **Desde el sistema** de Diforte (Costos > Gastos > «Actualizar ahora», solo administración): la PC lo toma en menos de 5 minutos. Si estaba apagada, el pedido espera hasta 24 horas. Si la copia falla, el pedido se reintenta solo cada 5 minutos, hasta 3 intentos (si lo rechaza la guardia, no se reintenta): después queda como fallido y se puede pedir otro. Una copia diaria o manual también atiende el pedido pendiente.
 
-## Relevamiento de compras (solo lectura)
+## Relevamiento de compras
 
-`relevar_compras.py` registra qué filas escribe Gestión Integral cuando se guarda un comprobante de compra. Usa la misma conexión de solo lectura que la copia. Lo que genera queda en la carpeta `relevamiento\` de la PC y no se sube a ningún lado. Contraseñas, tokens e imágenes nunca salen de la base.
+`relevar_compras.py` registra qué filas escribe Gestión Integral cuando se guarda un comprobante de compra. Usa la misma conexión de solo lectura que la copia: en Garro no puede escribir. Los modos manuales (abajo) dejan todo en la carpeta `relevamiento\` de la PC y no suben nada. Contraseñas, tokens e imágenes nunca salen de la base.
 
 ```powershell
 cd "$env:LOCALAPPDATA\Diforte\garro-sync"
@@ -88,6 +88,18 @@ cd "$env:LOCALAPPDATA\Diforte\garro-sync"
 El modo `pagos` vuelca las columnas, claves y cantidad de filas de las tablas de pagos, cheques, cajas y movimientos de fondos, las tablas chicas de referencia (tipos de pago, cajas, bancos, condiciones de compra) y los últimos pagos, movimientos y cheques con todo lo que cuelga de ellos. De números de cuenta, tarjeta y CBU y de los CUIT solo quedan los últimos 4 caracteres. De proveedores, clientes, operarios, firmantes de cheques y sus tablas auxiliares (`clientes_*`, `proveedores_*`) solo salen las columnas de una lista permitida (ids, razón social del proveedor, fechas, condiciones): domicilios, contactos y observaciones no salen, ni en `catalogo` ni en `comparar`. En todas las tablas de cuentas, tarjetas y billeteras, y en las que las vinculan con pagos y fondos, los números y comprobantes quedan con los últimos 4 y las observaciones no salen. Tampoco salen los códigos de tarjeta.
 
 `comparar` vuelca las filas nuevas o modificadas solo de las tablas del circuito de compras, pagos, caja, cuentas y productos (lista permitida). De cualquier otra tabla, y siempre de clientes, ventas, recibos, presupuestos, pedidos, remitos en tránsito, repartos, operarios y configuración, informa nada más cuántas filas cambiaron. De `logs_sistema` solo salen los logs de compras, pagos, movimientos de fondos, ajustes de cuenta corriente de proveedores y productos (sin el nombre del equipo); los demás se cuentan. Los hashes de las fotos llevan una clave aleatoria que se genera la primera vez y queda en `.clave-relevamiento`, al lado del script y fuera de la carpeta `relevamiento\` que se comparte. No sale de ninguna contraseña, así que ninguna fila queda con un hash comparable. `comparar` rechaza una foto de otra versión o de otra clave: hay que sacar una foto nueva antes de cargar el comprobante.
+
+### Modo automático (desde la v1.5.0)
+
+Nadie tiene que sacar fotos a mano: la tarea de cada 5 minutos (`--si-hay-pedido`) hace, después de atender el pedido de actualización (haya o no), una pasada de `relevar_compras.py auto`. Primero mira los contadores de cambios de las tablas de compras, pagos, fondos, ajustes, plan de cuentas y asientos (barato: no lee las tablas). Si no cambiaron, no hace nada. Si cambiaron, saca una foto, la compara con la anterior con la misma lógica y la misma redacción que `comparar` y, si cambió alguna tabla del circuito de compras, **sube la diferencia ya redactada** a la tabla privada `garro.relevamientos` de Supabase (de clientes, ventas, operarios y configuración solo sale la cantidad de cambios: ni filas, ni claves, ni hashes). Si la diferencia pasa de 4 MB, las tablas con más filas suben solo la cantidad.
+
+- Cada diferencia es el cambio neto entre dos fotos consecutivas, no la huella de un comprobante: si en la misma ventana se cargan varios, vienen juntos y los estados intermedios se pierden.
+- Lo local queda en `relevamiento\auto\<id>\` (una carpeta por base de origen): `estado.json`, la foto base y las últimas 200 diferencias (`diferencia-*.json`).
+- La primera pasada (o tras reiniciar el servidor de Garro, o si cambia la clave o la versión del relevamiento) solo toma la foto base y no sube nada.
+- Si la subida falla (red caída, falta la migración 373 en Supabase), la diferencia queda en disco, el log lo avisa en una línea y la próxima pasada sigue desde la foto nueva.
+- Una pasada que tarda más de 5 minutos no se pisa con la siguiente: usan un candado del sistema operativo sobre `relevamiento\auto\<id>\lock`, que Windows suelta solo si el proceso muere (no hay vencimientos). Cada pasada tiene además un tope de costo de 25 minutos: si la foto completa tarda más, se corta sin tocar el estado, queda una línea en el log y conviene apagar el modo automático (`RELEVAMIENTO_AUTO=0`).
+- Cualquier error del relevamiento queda en `garro_sync.log` y nunca cambia el resultado de la tarea ni de la copia.
+- Para apagarlo: `RELEVAMIENTO_AUTO=0` en `.env.garro-sync`. Para probarlo a mano: `.\python\python.exe relevar_compras.py auto`.
 
 ## Guardia
 

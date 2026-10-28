@@ -8,18 +8,25 @@ Viene con garro-sync y usa su Python y su .env.garro-sync. Desde la carpeta de i
         (se carga UN comprobante en Gestión Integral, como siempre)
     .\\python\\python.exe relevar_compras.py comparar      (contra la última foto)
     .\\python\\python.exe relevar_compras.py pagos         (estructura y ejemplos de pagos, cheques y cajas)
+    .\\python\\python.exe relevar_compras.py auto          (una pasada del relevamiento automático)
 
-La sesión se abre READ ONLY (conectar_origen de garro_sync): este script no puede escribir en la base.
-Lo que produce queda en la carpeta `relevamiento\\` y no se sube a ningún lado.
+La sesión se abre READ ONLY (conectar_origen de garro_sync): este script no puede escribir en la base de Garro.
+Los modos manuales dejan todo en la carpeta `relevamiento\\` y no suben nada. El modo `auto` lo dispara solo la
+tarea de cada 5 minutos (garro_sync.py --si-hay-pedido): guarda su estado en `relevamiento\\auto\\` y sube a
+Supabase (tabla privada `garro.relevamientos`) únicamente las diferencias ya redactadas, con las mismas reglas
+que `comparar`. Se apaga con RELEVAMIENTO_AUTO=0 en .env.garro-sync.
 """
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
 import secrets
+import socket
 import sys
 import tempfile
+import time
 from datetime import datetime
 
 AQUI = os.path.dirname(os.path.abspath(__file__))
@@ -207,9 +214,10 @@ def guardar(nombre: str, datos) -> str:
     return ruta
 
 
-def conectar():
+def conectar(cfg: dict[str, str] | None = None):
     global SAL
-    cfg = garro_sync.leer_archivo(os.path.join(AQUI, garro_sync.ARCHIVO_CONFIG))
+    if cfg is None:
+        cfg = garro_sync.leer_archivo(os.path.join(AQUI, garro_sync.ARCHIVO_CONFIG))
     SAL = clave_local()
     con = garro_sync.conectar_origen(cfg)  # ya deja la sesión readonly
     con.rollback()
@@ -560,12 +568,14 @@ def expr_hash(cols: list[str], tabla: str | None = None) -> tuple[sql.Composable
 
 def tomar_foto(cur) -> dict:
     """Un hash por fila de cada tabla. Con PK: {pk: md5}. Sin PK: {md5: cuántas filas iguales}."""
-    foto: dict = {"generado": datetime.now().isoformat(), "version_hash": VERSION_HASH, "clave": id_clave(), "tablas": {}}
+    # Con zona horaria: el relevamiento automático lo sube como timestamptz y no puede quedar corrido.
+    foto: dict = {"generado": datetime.now().astimezone().isoformat(), "version_hash": VERSION_HASH, "clave": id_clave(), "tablas": {}}
     pk = claves_primarias(cur)
     cols_por_tabla = columnas(cur)
     stats = {r["relname"]: r for r in filas(cur, """SELECT relname, n_tup_ins, n_tup_upd, n_tup_del
                                                      FROM pg_stat_user_tables WHERE schemaname = 'public'""")}
     for t in tablas(cur):
+        controlar_plazo()
         cols = pk.get(t)
         h, params = expr_hash(cols_por_tabla.get(t, []), t)
         filas_t: dict = {}
@@ -576,6 +586,7 @@ def tomar_foto(cur) -> dict:
             cur.execute(sql.SQL("SELECT {}, count(*) FROM public.{} t GROUP BY 1").format(h, sql.Identifier(t)), params)
             filas_t = {k: int(n) for k, n in cur.fetchall()}
         foto["tablas"][t] = {"pk": cols, "columnas": cols_por_tabla.get(t, []), "filas": filas_t, "stats": stats.get(t)}
+    controlar_plazo()
     return foto
 
 
@@ -604,49 +615,61 @@ def diferencia_tabla(a: dict, d: dict) -> dict:
             "hashes_baja": {h: -v for h, v in delta.items() if v < 0}}
 
 
+def calcular_cambios(cur, antes: dict, despues: dict) -> dict:
+    """Tablas que cambiaron entre dos fotos, con las filas redactadas de las que tienen detalle.
+
+    Lo usan `comparar` y el modo automático: misma lógica y misma redacción. El cursor tiene que ser el de la
+    transacción REPEATABLE READ donde se tomó `despues`, así lo que se cuenta es lo que se vuelca.
+    """
+    cambios: dict = {}
+    for t in sorted(set(antes["tablas"]) | set(despues["tablas"])):
+        controlar_plazo()
+        a, d = antes["tablas"].get(t), despues["tablas"].get(t)
+        item = diferencia_tabla(a, d)
+        item["tabla_nueva"], item["tabla_borrada"] = a is None, d is None
+        if not (item["altas"] or item["bajas"] or item["modificadas"] or item["tabla_nueva"] or item["tabla_borrada"]):
+            continue
+        item["stats_antes"] = (a or {}).get("stats")
+        item["stats_despues"] = (d or {}).get("stats")
+        if d is not None and con_detalle(t):
+            if item["pk"] and item["claves_alta_o_modif"]:
+                consulta = sql.SQL("SELECT row_to_json(t) AS r FROM public.{} t WHERE {} = ANY(%s)").format(
+                    sql.Identifier(t), expr_pk(item["pk"]))
+                volcadas = [limpiar(r["r"], t) for r in filas(cur, consulta, (item["claves_alta_o_modif"],))]
+                if t == "logs_sistema":
+                    ajenas = [f for f in volcadas if f.get("tipo_cbte_log_sistema") not in LOGS_PERMITIDOS]
+                    volcadas = [f for f in volcadas if f.get("tipo_cbte_log_sistema") in LOGS_PERMITIDOS]
+                    item["logs_de_otros_tipos"] = len(ajenas)
+                item["filas_nuevas_o_modificadas"] = volcadas
+            elif not item["pk"] and item["hashes_alta"]:
+                h, params = expr_hash(d.get("columnas", []), t)
+                consulta = sql.SQL("SELECT row_to_json(t) AS r, {} AS h FROM public.{} t WHERE {} = ANY(%s)").format(
+                    h, sql.Identifier(t), h)
+                vistos: set = set()
+                item["filas_nuevas_o_modificadas"] = []
+                for r in filas(cur, consulta, params + params + [list(item["hashes_alta"])]):
+                    if r["h"] not in vistos:  # una por hash; la cantidad está en hashes_alta
+                        vistos.add(r["h"])
+                        item["filas_nuevas_o_modificadas"].append({"veces": item["hashes_alta"][r["h"]], **limpiar(r["r"], t)})
+        elif t in TABLAS_SECRETAS:
+            item["filas_nuevas_o_modificadas"] = "<omitido: tabla con secretos>"
+        elif d is not None:
+            item["filas_nuevas_o_modificadas"] = "<omitido: clientes, ventas o configuración; solo se cuentan los cambios>"
+        cambios[t] = item
+    controlar_plazo()
+    return cambios
+
+
 def comparar(con, ruta_antes: str) -> str:
     with open(ruta_antes, encoding="utf-8") as f:
         antes = json.load(f)
     if antes.get("version_hash") != VERSION_HASH or antes.get("clave") != id_clave():
         raise SystemExit(f"La foto {os.path.basename(ruta_antes)} es de otra versión del relevamiento (o de otra clave): "
                          "no se puede comparar. Sacá una foto nueva antes de cargar el comprobante.")
-    cambios: dict = {}
     # La foto nueva y el detalle salen de la MISMA transacción REPEATABLE READ: lo que se cuenta es lo que se vuelca.
     with con.cursor() as cur:
         despues = tomar_foto(cur)
-        for t in sorted(set(antes["tablas"]) | set(despues["tablas"])):
-            a, d = antes["tablas"].get(t), despues["tablas"].get(t)
-            item = diferencia_tabla(a, d)
-            item["tabla_nueva"], item["tabla_borrada"] = a is None, d is None
-            if not (item["altas"] or item["bajas"] or item["modificadas"] or item["tabla_nueva"] or item["tabla_borrada"]):
-                continue
-            item["stats_antes"] = (a or {}).get("stats")
-            item["stats_despues"] = (d or {}).get("stats")
-            if d is not None and con_detalle(t):
-                if item["pk"] and item["claves_alta_o_modif"]:
-                    consulta = sql.SQL("SELECT row_to_json(t) AS r FROM public.{} t WHERE {} = ANY(%s)").format(
-                        sql.Identifier(t), expr_pk(item["pk"]))
-                    volcadas = [limpiar(r["r"], t) for r in filas(cur, consulta, (item["claves_alta_o_modif"],))]
-                    if t == "logs_sistema":
-                        ajenas = [f for f in volcadas if f.get("tipo_cbte_log_sistema") not in LOGS_PERMITIDOS]
-                        volcadas = [f for f in volcadas if f.get("tipo_cbte_log_sistema") in LOGS_PERMITIDOS]
-                        item["logs_de_otros_tipos"] = len(ajenas)
-                    item["filas_nuevas_o_modificadas"] = volcadas
-                elif not item["pk"] and item["hashes_alta"]:
-                    h, params = expr_hash(d.get("columnas", []), t)
-                    consulta = sql.SQL("SELECT row_to_json(t) AS r, {} AS h FROM public.{} t WHERE {} = ANY(%s)").format(
-                        h, sql.Identifier(t), h)
-                    vistos: set = set()
-                    item["filas_nuevas_o_modificadas"] = []
-                    for r in filas(cur, consulta, params + params + [list(item["hashes_alta"])]):
-                        if r["h"] not in vistos:  # una por hash; la cantidad está en hashes_alta
-                            vistos.add(r["h"])
-                            item["filas_nuevas_o_modificadas"].append({"veces": item["hashes_alta"][r["h"]], **limpiar(r["r"], t)})
-            elif t in TABLAS_SECRETAS:
-                item["filas_nuevas_o_modificadas"] = "<omitido: tabla con secretos>"
-            elif d is not None:
-                item["filas_nuevas_o_modificadas"] = "<omitido: clientes, ventas o configuración; solo se cuentan los cambios>"
-            cambios[t] = item
+        cambios = calcular_cambios(cur, antes, despues)
     con.rollback()
     guardar(f"foto-{ahora()}.json", despues)
     ruta = guardar(f"diferencia-{ahora()}.json", {"antes": ruta_antes, "despues": despues["generado"], "cambios": cambios})
@@ -659,10 +682,308 @@ def comparar(con, ruta_antes: str) -> str:
     return ruta
 
 
+# ------------------------------------------------------------------ relevamiento automático
+
+# Tablas que Gestión Integral toca al guardar una compra, un pago o un movimiento de fondos: si ninguna cambió,
+# no vale la pena ni sacar la foto completa. `productos` no está: las ventas también la actualizan y una compra
+# ya cambia items_comprobantes_compras.
+DISPARADORES = ["comprobantes_compras", "items_comprobantes_compras", "pagos", "movimientos_fondos",
+                "ajustes_cuenta_corriente_proveedores", "planes_de_cuentas", "asientos_contables"]
+# Tope de costo de una pasada (el candado no depende de esto: lo suelta el sistema operativo si el proceso muere).
+LIMITE_CORRIDA_SEGUNDOS = 25 * 60
+_plazo: tuple[float, float] | None = None  # (inicio, vencimiento) en reloj() de la pasada automática en curso
+
+
+class CorridaDemasiadoLarga(Exception):
+    pass
+
+
+def reloj() -> float:
+    return time.monotonic()
+
+
+def controlar_plazo() -> None:
+    """Solo rige en el modo automático (`_plazo` es None en foto/comparar a mano)."""
+    if _plazo is not None and reloj() > _plazo[1]:
+        raise CorridaDemasiadoLarga(f"{int(reloj() - _plazo[0])}")
+MAX_BYTES_SUBIDA = 4 * 1024 * 1024
+MAX_DIFERENCIAS_LOCALES = 200
+
+
+def dir_auto(cfg: dict[str, str]) -> str:
+    """Una carpeta por base de origen: si cambia el servidor, la base o el puerto, no se compara contra otra base."""
+    origen = f"{cfg.get('GARRO_HOST', '')}|{cfg.get('GARRO_PUERTO', '')}|{cfg.get('GARRO_BASE', '')}"
+    return os.path.join(SALIDA, "auto", hashlib.sha256(origen.encode()).hexdigest()[:12])
+
+
+def escribir_atomico(ruta: str, datos) -> None:
+    """Temporal en la misma carpeta + os.replace: nunca queda un JSON a medio escribir."""
+    fd, temporal = tempfile.mkstemp(dir=os.path.dirname(ruta), prefix=".tmp-", suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(datos, f, ensure_ascii=False, default=str)
+        os.replace(temporal, ruta)
+    except BaseException:
+        try:
+            os.remove(temporal)
+        except OSError:
+            pass
+        raise
+
+
+def tomar_lock(cfg: dict[str, str]):
+    """Candado del sistema operativo sobre un archivo abierto durante toda la pasada: si el proceso muere, el sistema
+    lo suelta solo (sin vencimientos ni carreras). Devuelve el archivo abierto, o None si otra pasada lo tiene."""
+    f = open(os.path.join(dir_auto(cfg), "lock"), "a+b")
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+            f.seek(0, os.SEEK_END)
+            if f.tell() == 0:
+                f.write(b"0")
+                f.flush()
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.close()
+        return None
+    return f
+
+
+def soltar_lock(f) -> None:
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+    finally:
+        f.close()
+
+
+def leer_estado(cfg: dict[str, str]) -> tuple[dict, dict] | None:
+    """(estado, foto base) o None si falta o está dañado: en ese caso se arranca de cero."""
+    try:
+        with open(os.path.join(dir_auto(cfg), "estado.json"), encoding="utf-8") as f:
+            estado = json.load(f)
+        with open(os.path.join(dir_auto(cfg), estado["foto"]), encoding="utf-8") as f:
+            return estado, json.load(f)
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def guardar_base(cfg: dict[str, str], nueva: dict, contadores: dict) -> None:
+    """La foto nueva pasa a ser la base. El estado se publica al final: si algo falla antes, queda el anterior."""
+    controlar_plazo()  # pasado el tope no se publica nada: la próxima pasada reintenta desde la base anterior
+    carpeta = dir_auto(cfg)
+    nombre = f"base-{ahora()}.json"
+    escribir_atomico(os.path.join(carpeta, nombre), nueva)
+    escribir_atomico(os.path.join(carpeta, "estado.json"),
+                     {"contadores": contadores, "foto": nombre, "generado": datetime.now().astimezone().isoformat()})
+    for f in os.listdir(carpeta):  # la base anterior y las huérfanas de una corrida cortada
+        if f.startswith("base-") and f != nombre:
+            try:
+                os.remove(os.path.join(carpeta, f))
+            except OSError:
+                pass
+
+
+def leer_contadores(cur) -> dict[str, int]:
+    """Altas + modificaciones + bajas acumuladas de las tablas disparadoras (barato: no toca las tablas)."""
+    cur.execute("""SELECT relname, COALESCE(n_tup_ins, 0) + COALESCE(n_tup_upd, 0) + COALESCE(n_tup_del, 0)
+                   FROM pg_stat_user_tables WHERE schemaname = 'public' AND relname::text = ANY(%s::text[])""", (DISPARADORES,))
+    return {t: int(n) for t, n in cur.fetchall()}
+
+
+CLAVES_DE_FILAS = ("claves_alta_o_modif", "claves_borradas", "hashes_alta", "hashes_baja")
+
+
+class DiferenciaDemasiadoGrande(Exception):
+    """Ni con solo los conteos entra en el límite; `minima` es esa versión para dejarla en disco."""
+
+    def __init__(self, minima: dict):
+        super().__init__("la diferencia no entra en el límite de subida")
+        self.minima = minima
+
+
+def para_subir(cambios: dict) -> dict:
+    """Lo que sale del servidor: las tablas sin detalle (clientes, ventas, configuración...) y las borradas solo
+    informan cantidades, sin las claves ni los hashes de sus filas. `comparar` a mano no pasa por acá."""
+    out = copy.deepcopy(cambios)
+    for t, c in out.items():
+        sin_filas = not con_detalle(t) or c.get("tabla_borrada")
+        for k in CLAVES_DE_FILAS:
+            # logs_sistema mezcla entidades (clientes, ventas...): sus claves y hashes no salen nunca.
+            if k in c and (sin_filas or t == "logs_sistema"):
+                del c[k]
+    return out
+
+
+def acotar(carga: dict, maximo: int = MAX_BYTES_SUBIDA) -> dict:
+    """Garantiza que el JSON no pase de `maximo`: primero se recortan las filas volcadas de las tablas más pesadas,
+    después sus claves y hashes y, como último recurso, cada tabla queda solo con sus cantidades."""
+    def tamano() -> int:
+        return len(json.dumps(carga, default=str, ensure_ascii=False).encode("utf-8"))
+    if tamano() <= maximo:
+        return carga
+    carga = copy.deepcopy(carga)
+
+    def recortar(campos: tuple[str, ...], texto: str) -> bool:
+        pesos = sorted(((len(json.dumps(c[k], default=str)), t, k) for t, c in carga["cambios"].items()
+                        for k in campos if isinstance(c.get(k), (list, dict))), reverse=True)
+        for _, t, k in pesos:
+            item = carga["cambios"][t]
+            item[k] = f"<recortado: {len(item[k])} {texto}>"
+            if tamano() <= maximo:
+                return True
+        return False
+
+    if recortar(("filas_nuevas_o_modificadas",), "filas") or recortar(CLAVES_DE_FILAS, "claves"):
+        return carga
+    for c in carga["cambios"].values():
+        for k in ("filas_nuevas_o_modificadas", *CLAVES_DE_FILAS, "stats_antes", "stats_despues"):
+            c.pop(k, None)
+    if tamano() > maximo:
+        raise DiferenciaDemasiadoGrande(carga)
+    return carga
+
+
+def guardar_diferencia(cfg: dict[str, str], carga: dict) -> str:
+    carpeta = dir_auto(cfg)
+    ruta = os.path.join(carpeta, f"diferencia-{ahora()}.json")
+    escribir_atomico(ruta, carga)
+    viejas = sorted(f for f in os.listdir(carpeta) if f.startswith("diferencia-") and f.endswith(".json"))
+    for f in viejas[:-MAX_DIFERENCIAS_LOCALES]:
+        try:
+            os.remove(os.path.join(carpeta, f))
+        except OSError:
+            pass
+    return ruta
+
+
+def subir(cfg: dict[str, str], carga: dict) -> None:
+    """Sube la diferencia ya redactada a garro.relevamientos, en una transacción propia y corta."""
+    con = garro_sync.conectar_destino(cfg)
+    try:
+        with con.cursor() as cur:
+            cur.execute("SET LOCAL statement_timeout = '60s'")  # una subida colgada no puede frenar la tarea
+            cur.execute("SELECT garro.subir_relevamiento(%s, %s, %s, %s, %s::jsonb)",
+                        (socket.gethostname(), carga["antes"], carga["despues"], VERSION_HASH,
+                         json.dumps(carga["cambios"], default=str, ensure_ascii=False)))
+        con.commit()
+    finally:
+        con.close()
+
+
+def auto(cfg: dict[str, str]) -> str:
+    """Una pasada del relevamiento automático. Devuelve el resultado en una palabra (o 'subido N')."""
+    if cfg.get("RELEVAMIENTO_AUTO", "1").strip() == "0":
+        return "desactivado"
+    os.makedirs(dir_auto(cfg), exist_ok=True)
+    lock = tomar_lock(cfg)
+    if lock is None:
+        return "ocupado"
+    global _plazo
+    _plazo = (reloj(), reloj() + LIMITE_CORRIDA_SEGUNDOS)
+    try:
+        return _auto(cfg)
+    except CorridaDemasiadoLarga as e:
+        garro_sync.decir(f"El relevamiento automático pasó el límite de {LIMITE_CORRIDA_SEGUNDOS // 60} minutos "
+                         f"({e} s): la foto completa es demasiado lenta para este servidor. Se puede apagar con "
+                         "RELEVAMIENTO_AUTO=0 en .env.garro-sync.")
+        return "demasiado_larga"
+    finally:
+        _plazo = None
+        soltar_lock(lock)
+
+
+def _auto(cfg: dict[str, str]) -> str:
+    previo = leer_estado(cfg)
+    con = conectar(cfg)
+    try:
+        with con.cursor() as cur:
+            contadores = leer_contadores(cur)
+            if previo is None:
+                guardar_base(cfg, tomar_foto(cur), contadores)
+                return "base_inicial"
+            estado, base = previo
+            guardados = estado.get("contadores") or {}
+            if any(contadores.get(t, 0) < n for t, n in guardados.items()):
+                # Estadísticas reiniciadas (el servidor se reinició): los números ya no se pueden comparar.
+                guardar_base(cfg, tomar_foto(cur), contadores)
+                return "base_reiniciada"
+            if contadores == guardados:
+                return "sin_cambios"
+            despues = tomar_foto(cur)
+            if base.get("version_hash") != VERSION_HASH or base.get("clave") != id_clave():
+                guardar_base(cfg, despues, contadores)
+                return "base_reiniciada"
+            cambios = calcular_cambios(cur, base, despues)
+    finally:
+        con.rollback()
+        con.close()
+
+    if not any(con_detalle(t) for t in cambios):
+        guardar_base(cfg, despues, contadores)
+        return "sin_cambios_compras"
+    decir = garro_sync.decir
+    carga: dict | None = None
+    problema: Exception | None = None
+    try:
+        carga = acotar({"antes": base["generado"], "despues": despues["generado"], "cambios": para_subir(cambios)})
+    except DiferenciaDemasiadoGrande as e:
+        carga, problema = e.minima, e
+    # Guardar en disco y subir se resuelven por separado: cada uno puede fallar sin arrastrar al otro.
+    try:
+        guardar_diferencia(cfg, carga)
+        guardada = True
+    except OSError as e:
+        guardada = False
+        decir(f"No se pudo guardar la diferencia en disco ({type(e).__name__}).")
+    donde = "queda guardada acá" if guardada else "no quedó guardada"
+    if problema is not None:
+        decir(f"La diferencia no entra en el límite de subida: {donde}, solo con los conteos.")
+        subida = False
+    else:
+        try:
+            subir(cfg, carga)
+            subida = True
+        except Exception as e:
+            subida = False
+            if getattr(e, "pgcode", None) == "42883":
+                decir(f"Falta la migración 373 en Supabase (relevamiento automático): la diferencia {donde}.")
+            else:
+                decir(f"No se pudo subir el relevamiento ({type(e).__name__}); la diferencia {donde}.")
+    if not (guardada or subida):
+        # Ni en disco ni en Supabase: la base no avanza y la próxima pasada recalcula la ventana completa.
+        return "reintentar"
+    # La ventana avanza: la diferencia ya salió por alguno de los dos caminos y no conviene que crezca sin límite.
+    try:
+        guardar_base(cfg, despues, contadores)
+    except OSError:
+        garro_sync.decir("No se pudo guardar el estado local; la próxima pasada vuelve a subir la ventana, "
+                         "que se reemplaza en Supabase.")
+        return "reintentar"
+    return f"subido {sum(1 for t in cambios if con_detalle(t))}" if subida else "solo_local"
+
+
 def main(argv: list[str]) -> int:
-    if not argv or argv[0] not in ("catalogo", "foto", "comparar", "pagos"):
+    if not argv or argv[0] not in ("catalogo", "foto", "comparar", "pagos", "auto"):
         print(__doc__)
         return 2
+    if argv[0] == "auto":
+        cfg = garro_sync.leer_archivo(os.path.join(AQUI, garro_sync.ARCHIVO_CONFIG))
+        inicio = time.monotonic()
+        resultado = auto(cfg)
+        print(f"Relevamiento automático: {resultado} ({int(time.monotonic() - inicio)} s)")
+        return 0
     antes = argv[1] if len(argv) > 1 else None
     if argv[0] == "comparar" and antes is None:
         # Sin argumento: la última foto (los nombres llevan fecha y hora, así que el orden alfabético es el temporal).
