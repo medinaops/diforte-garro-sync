@@ -6,6 +6,7 @@ Los tests de paridad con las migraciones 329/334/349 leen el repo diforte-produc
 la variable DIFORTE_PRODUCCION o en una carpeta hermana; si no lo encuentran, se saltean.
 """
 
+import errno
 import glob
 import io
 import json
@@ -1380,6 +1381,36 @@ class RelevamientoAutomatico(unittest.TestCase):
         cfg = {"GARRO_HOST": "otro"}
         rc.auto(cfg)
         rc.conectar.assert_called_once_with(cfg)
+
+    def test_subida_que_devuelve_null_cuenta_como_fallida(self):
+        con = ConexionAuto()
+        con.cur.fetchone.return_value = (None,)
+        with mock.patch.object(rc.garro_sync, "conectar_destino", return_value=con):
+            with self.assertRaises(RuntimeError):
+                REAL_SUBIR({}, {"antes": "a", "despues": "d", "cambios": {}})
+        con.commit.assert_not_called()
+        con.close.assert_called_once()
+        con.cur.fetchone.return_value = (7,)
+        with mock.patch.object(rc.garro_sync, "conectar_destino", return_value=con):
+            REAL_SUBIR({}, {"antes": "a", "despues": "d", "cambios": {}})
+        con.commit.assert_called_once()
+
+    def test_null_en_la_subida_con_disco_ok_es_solo_local_y_sin_disco_reintenta(self):
+        self.preparar_cambio()
+        self.error_subida = RuntimeError("rechazada")
+        self.assertEqual(rc.auto({}), "solo_local")
+        self.contadores = {"comprobantes_compras": 12}
+        with mock.patch.object(rc, "guardar_diferencia", side_effect=OSError("disco")):
+            self.assertEqual(rc.auto({}), "reintentar")
+
+    def test_un_error_que_no_es_contencion_se_propaga_y_cierra_el_archivo(self):
+        os.makedirs(self.dir())
+        with mock.patch("fcntl.flock", side_effect=OSError(errno.EIO, "io")):
+            with self.assertRaises(OSError):
+                rc.tomar_lock({})
+        libre = rc.tomar_lock({})  # el handle anterior quedó cerrado y sin candado
+        self.assertIsNotNone(libre)
+        rc.soltar_lock(libre)
 
     def test_la_subida_pone_un_tope_de_tiempo_a_la_sentencia(self):
         con = ConexionAuto()

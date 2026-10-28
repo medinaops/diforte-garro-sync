@@ -19,6 +19,7 @@ que `comparar`. Se apaga con RELEVAMIENTO_AUTO=0 en .env.garro-sync.
 from __future__ import annotations
 
 import copy
+import errno
 import hashlib
 import json
 import os
@@ -743,13 +744,22 @@ def tomar_lock(cfg: dict[str, str]):
                 f.write(b"0")
                 f.flush()
             f.seek(0)
-            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+            pedir = lambda: msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)  # noqa: E731
+            ocupado = (errno.EACCES, errno.EDEADLK, 36)
         else:
             import fcntl
-            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        f.close()
-        return None
+            pedir = lambda: fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)  # noqa: E731
+            ocupado = (errno.EAGAIN, errno.EWOULDBLOCK, errno.EACCES)
+        try:
+            pedir()
+        except OSError as e:
+            if e.errno in ocupado:
+                f.close()
+                return None  # otra pasada lo tiene
+            raise
+    except BaseException:
+        f.close()  # cualquier otra falla (escritura, permisos) se propaga para que quede en el log
+        raise
     return f
 
 
@@ -877,6 +887,9 @@ def subir(cfg: dict[str, str], carga: dict) -> None:
             cur.execute("SELECT garro.subir_relevamiento(%s, %s, %s, %s, %s::jsonb)",
                         (socket.gethostname(), carga["antes"], carga["despues"], VERSION_HASH,
                          json.dumps(carga["cambios"], default=str, ensure_ascii=False)))
+            fila = cur.fetchone()
+            if not fila or fila[0] is None:  # el upsert fue rechazado: no se cuenta como subido
+                raise RuntimeError("Supabase rechazó el relevamiento (la función no devolvió id)")
         con.commit()
     finally:
         con.close()

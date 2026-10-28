@@ -60,7 +60,7 @@ $PythonSha256    = "0eb85c2dfccccf1b17352de4c397f69194035b7d37149eacc16f1147d93d
 $HashesPaquete = @{
     "actualizar-ahora.bat" = "82b5fc5df5775d5d6680c085c5b5f417cc5f7658be8ecc8a3b9029218776e177"
     "garro_sync.py" = "987b4355b8b646f17a191968dce674f30700be44d42b71e1966cbce4c2f45a86"
-    "relevar_compras.py" = "7d5fa542782fcbd75ae6675a66006b59bc0ce70bf82b4f72972a859a8b5bafc5"
+    "relevar_compras.py" = "ee9eb74799f97ce01be1a794add4da18836dc5b233d9314ba8e2c66d1e656056"
     "requirements.txt" = "b3e919e8eac4bfae6f8d92ab116ee3fef65ce487bc818cbcbb38228be74e3703"
     "supabase-ca-2021.crt" = "700723581420dd1ac98fd7e9ac529f0ef210eadcaf87fc868a3ad7d114c2f3b7"
 }
