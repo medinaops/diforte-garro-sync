@@ -1405,7 +1405,8 @@ class RelevamientoAutomatico(unittest.TestCase):
 
     def test_un_error_que_no_es_contencion_se_propaga_y_cierra_el_archivo(self):
         os.makedirs(self.dir())
-        with mock.patch("fcntl.flock", side_effect=OSError(errno.EIO, "io")):
+        bloqueo = "msvcrt.locking" if os.name == "nt" else "fcntl.flock"  # el que usa tomar_lock en esta plataforma
+        with mock.patch(bloqueo, side_effect=OSError(errno.EIO, "io")):
             with self.assertRaises(OSError):
                 rc.tomar_lock({})
         libre = rc.tomar_lock({})  # el handle anterior quedó cerrado y sin candado
