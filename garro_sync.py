@@ -26,7 +26,7 @@ Uso:
     python garro_sync.py --si-hay-pedido  # copia solo si alguien pidió «Actualizar ahora» (tarea de cada 5 min; después hace una pasada del relevamiento automático)
     python garro_sync.py --prueba-destino # prueba la conexión segura y la contraseña de Supabase; no escribe nada
     python garro_sync.py --forzar      # copia saltando la guardia de la foto (solo uso manual)
-    python garro_sync.py --ddl         # imprime el SQL de las tablas espejo (migs 329 + 350 + 372)
+    python garro_sync.py --ddl         # imprime el SQL de las tablas espejo (migs 329 + 350 + 372 + 388)
 
 Configuración: archivo `.env.garro-sync` al lado de este script (ver README.md).
 """
@@ -53,7 +53,7 @@ from datetime import datetime, timezone
 # De las cotizaciones (`presupuestos` en Garro, distintas del comprobante de venta tipo «Presupuesto»)
 # se copian cabecera, cliente, ítems, producto y concepto de cada ítem; NO se copian el operario
 # ni los recordatorios.
-# Esta lista es la fuente de verdad de las migraciones 329 + 350 + 372 (`--ddl`): si se cambia,
+# Esta lista es la fuente de verdad de las migraciones 329 + 350 + 372 + 388 (`--ddl`): si se cambia,
 # va una migración nueva con el mismo cambio.
 TABLAS: list[tuple[str, str, list[tuple[str, str]]]] = [
     ("tipos_comprobantes_ventas", "id_tipo_comprobante_venta", [
@@ -342,6 +342,17 @@ TABLAS: list[tuple[str, str, list[tuple[str, str]]]] = [
         ("id_otro_medio_de_pago_en_movimiento_fondo", "integer"), ("fk_id_movimiento_fondo", "integer"),
         ("fk_id_otro_medio_de_pago", "integer"), ("fk_id_caja", "integer"),
     ]),
+    # mig 388: percepciones de las compras (IIBB, etc.) y su catálogo. Suman al total del comprobante en el saldo
+    # del proveedor; no son costo. Pueden venir vacías: no están en OBLIGATORIAS.
+    ("regimenes_especiales", "id_regimen_especial", [
+        ("id_regimen_especial", "integer"), ("cod_regimen_especial", "text"), ("des_regimen_especial", "text"),
+        ("fk_id_impuesto_compra", "integer"), ("fk_id_tipo_regimen_compra", "integer"),
+        ("fk_id_plan_de_cuenta", "integer"),
+    ]),
+    ("regimenes_especiales_x_comprobantes_compras", "id_regimen_especial_x_comprobante_compra", [
+        ("id_regimen_especial_x_comprobante_compra", "integer"), ("fk_id_comprobante_compra", "integer"),
+        ("fk_id_regimen_especial", "integer"), ("imp_regimen_especial_x_comprobante_compra", "double precision"),
+    ]),
 ]
 
 ARCHIVO_CONFIG = ".env.garro-sync"
@@ -446,7 +457,7 @@ def decir(texto: str = "") -> None:
 
 
 def ddl() -> str:
-    """SQL de las tablas espejo (migraciones 329 + 350 + 372)."""
+    """SQL de las tablas espejo (migraciones 329 + 350 + 372 + 388)."""
     partes = []
     for nombre, pk, columnas in TABLAS:
         cols = ",\n  ".join(f"{c} {t}" + (" PRIMARY KEY" if c == pk else "") for c, t in columnas)
@@ -747,9 +758,9 @@ SIN_COPIAR = (
     "movimientos_billetera_virtual_en_pagos", "movimientos_billetera_virtual_en_movimientos_fondos",
     "movimientos_tarjeta_credito_en_movimientos_fondos", "tarjetas_creditos_propias_en_pagos",
     "tarjetas_creditos_propias_en_movimientos_fondos",
-    # Retenciones de Ganancias en pagos, percepciones de las compras y aplicación de saldos a cuenta: cambian el
-    # saldo de un proveedor y el 27/10/2026 estaban vacías.
-    "retenciones_ganancias", "regimenes_especiales_x_comprobantes_compras", "pagos_saldos_sin_imputar_en_pago",
+    # Retenciones de Ganancias en pagos y aplicación de saldos a cuenta: cambian el saldo de un proveedor y el
+    # 27/10/2026 estaban vacías. (Las percepciones de las compras se copian desde la v1.6.0, mig 388.)
+    "retenciones_ganancias", "pagos_saldos_sin_imputar_en_pago",
 )
 
 

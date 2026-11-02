@@ -40,7 +40,8 @@ def migracion(numero):
     """Ruta de la migración `numero` en diforte-produccion (o salta el test si no está a mano)."""
     candidatos = [os.environ.get("DIFORTE_PRODUCCION", ""),
                   os.path.join(AQUI, "..", "diforte-produccion"),
-                  os.path.join(AQUI, "..", "diforte-produccion-garro-sync")]
+                  os.path.join(AQUI, "..", "diforte-produccion-garro-sync"),
+                  os.path.join(AQUI, "..", "diforte-produccion-percepciones")]
     for base in candidatos:
         rutas = sorted(glob.glob(os.path.join(base, "supabase", "migrations", f"{numero}_*.sql"))) if base else []
         rutas = [r for r in rutas if not r.endswith(".down.sql")]
@@ -155,7 +156,7 @@ class ParidadMigracion(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.sql = ""
-        for numero in (329, 350, 372):
+        for numero in (329, 350, 372, 388):
             with open(migracion(numero), encoding="utf-8") as f:
                 cls.sql += f.read() + "\n"
 
@@ -645,6 +646,23 @@ class MediosSinCopiar(unittest.TestCase):
 
     def test_sin_copiar_no_se_superpone_con_tablas(self):
         self.assertFalse(set(g.SIN_COPIAR) & {n for n, _, _ in g.TABLAS})
+
+    def test_percepciones_se_copian_y_ya_no_frenan_la_corrida(self):
+        nombres = {n for n, _, _ in g.TABLAS}
+        self.assertLessEqual({"regimenes_especiales", "regimenes_especiales_x_comprobantes_compras"}, nombres)
+        self.assertNotIn("regimenes_especiales_x_comprobantes_compras", g.SIN_COPIAR)
+        cur = self.Cur(["regimenes_especiales_x_comprobantes_compras", "retenciones_ganancias"],
+                       {"regimenes_especiales_x_comprobantes_compras": 1})
+        self.assertEqual(g.contar_sin_copiar(cur), {})
+
+    def test_percepciones_en_el_ddl_y_no_son_obligatorias(self):
+        sql = g.ddl()
+        self.assertIn("CREATE TABLE garro.regimenes_especiales (", sql)
+        self.assertIn("imp_regimen_especial_x_comprobante_compra double precision", sql)
+        self.assertNotIn("regimenes_especiales", g.OBLIGATORIAS)
+        self.assertNotIn("regimenes_especiales_x_comprobantes_compras", g.OBLIGATORIAS)
+        g.validar_foto({**{t: 1 for t in g.OBLIGATORIAS}, "regimenes_especiales": 0,
+                        "regimenes_especiales_x_comprobantes_compras": 0}, None, False)
 
 
 class GuardiaDeFoto(unittest.TestCase):
