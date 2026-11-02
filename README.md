@@ -108,7 +108,7 @@ Antes de vaciar el espejo se valida lo leído. Si algo no cierra, **no se public
 - Las tablas clave (comprobantes, ítems, clientes, proveedores, productos, tipos, monedas) nunca pueden venir vacías.
 - Desde la v1.4.0 tampoco pueden venir vacíos pagos, cheques y movimientos de fondos.
 - Desde la v1.6.0 se copian las percepciones de las compras (`regimenes_especiales` y `regimenes_especiales_x_comprobantes_compras`); pueden venir vacías.
-- Algunos medios de pago que Gestión Integral tiene, pero que no se usaban cuando se armó la copia, no se copian: tarjetas, billeteras virtuales, depósitos en efectivo, cheques en movimientos de fondos, retenciones de Ganancias, percepciones y saldos sin imputar. Si alguno empieza a usarse, la copia frena con un aviso, para no dejar pagos o gastos sin su importe, hasta que se lo sume a la copia.
+- Algunos medios de pago que Gestión Integral tiene, pero que no se usaban cuando se armó la copia, no se copian: tarjetas, billeteras virtuales, depósitos en efectivo, cheques en movimientos de fondos, retenciones de Ganancias y saldos sin imputar. Si alguno empieza a usarse, la copia frena con un aviso, para no dejar pagos o gastos sin su importe, hasta que se lo sume a la copia.
 - Contra la última copia correcta: una tabla no puede pasar de tener filas a cero; comprobantes e ítems no pueden bajar más de 2 %; el resto, más de 20 %. Bajas de hasta 2 filas no alertan.
 
 `--forzar` saltea la guardia. Es solo para uso manual cuando una baja es real y esperada; las tareas programadas nunca la usan.
