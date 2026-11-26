@@ -1063,11 +1063,25 @@ def correr_prueba_destino(cfg: dict[str, str]) -> bool:
 def correr_pedido(config: str) -> int:
     """Modo de la tarea de cada 5 minutos: latido y, si hay un pedido, copia normal con la guardia.
 
-    Pase lo que pase con el pedido, después hace una pasada del relevamiento automático (nunca cambia el resultado).
+    Pase lo que pase con el pedido, después hace una pasada de la cola de cargas (apagada por defecto) y una del
+    relevamiento automático (ninguna cambia el resultado).
     """
     codigo = _atender_pedido(config)
+    cargas_auto(config)
     relevamiento_auto(config)
     return codigo
+
+
+def cargas_auto(config: str) -> None:
+    """Mejor esfuerzo: la cola de cargas de compras (apagada salvo CARGAS=1). Cualquier falla queda en el log."""
+    try:
+        if leer_archivo(config).get("CARGAS", "0").strip() != "1":
+            return
+        import garro_escritor  # acá y no arriba: garro_escritor importa garro_sync
+        garro_escritor.pasada(leer_archivo(config))
+    except (Exception, SystemExit) as e:
+        escribir_traza(limitar=True)
+        decir(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} (cargas) ERROR: {type(e).__name__}: {e}")
 
 
 def relevamiento_auto(config: str) -> None:

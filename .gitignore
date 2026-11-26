@@ -6,3 +6,7 @@ __pycache__/
 version.txt
 relevamiento/
 .clave-relevamiento
+cargas-diario.jsonl
+cargas.lock
+copia-*.dump
+garro_sync.log.traza

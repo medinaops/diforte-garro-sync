@@ -1,0 +1,1037 @@
+"""Carga de comprobantes de compra en Gestión Integral: escritor.
+
+Escribe en la base del programa lo que planificó `garro_cargas.py`, igual que lo hace el programa cuando una
+persona carga la compra a mano. Es la única parte de garro-sync que escribe en Garro, así que está encerrada:
+
+  - APAGADA por defecto: hace falta `CARGAS=1` en el .env, y para escribir de verdad también `CARGAS_REAL=1`
+    (además del interruptor del lado de Supabase). Sin las dos llaves, todo se procesa en seco.
+  - Todo o nada: cada comprobante va en UNA transacción con las tablas bloqueadas; si algo no cierra, ROLLBACK.
+  - Antes de escribir se verifica que la estructura de las tablas sea exactamente la de la receta y que no haya
+    triggers ni reglas. Lo que no está confirmado, no se escribe.
+  - La base real solo se escribe por la cola de Supabase (`--pasada`); a mano solo contra una copia de la base.
+
+Uso:
+    python garro_escritor.py --pasada                         # lo que hace la tarea de cada 5 minutos
+    python garro_escritor.py --estructura                     # prueba la instalación (solo lectura)
+    python garro_escritor.py --archivo carga.json             # planifica una carga en solo lectura
+    python garro_escritor.py --archivo carga.json --escribir --base OTRA   # la escribe en una COPIA de la base
+    python garro_escritor.py --deshacer N [--confirmar]       # borra lo que escribió la carga N
+"""
+
+from __future__ import annotations
+
+import argparse
+import errno
+import hashlib
+import json
+import os
+import sys
+import time
+from datetime import date, datetime
+
+import garro_cargas as gc
+import garro_sync as g
+
+AQUI = os.path.dirname(os.path.abspath(__file__))
+DIARIO = os.path.join(AQUI, "cargas-diario.jsonl")
+ARCHIVO_LOCK = os.path.join(AQUI, "cargas.lock")
+
+OPERARIO_POR_DEFECTO = "botcompras"
+POR_PASADA_DEFECTO = 1
+POR_PASADA_MAXIMO = 5
+TOLERANCIA_TOTAL = 0.01
+TOLERANCIA_ASIENTO = 0.005
+LOCK_TABLAS = ("LOCK TABLE comprobantes_compras, asientos_contables, pagos_en_comprobantes_compras "
+               "IN SHARE ROW EXCLUSIVE MODE")
+
+# Orden de las tablas hijas en `escrito` (y, al revés, el de borrado).
+TABLAS_ESCRITO = (
+    "comprobantes_compras", "items_comprobantes_compras", "conceptos_compras",
+    "conceptos_x_items_comprobantes_compras", "regimenes_especiales_x_comprobantes_compras",
+    "asientos_contables", "asientos_contables_movimientos", "pagos_en_comprobantes_compras",
+)
+
+
+class ErrorEstructura(Exception):
+    """La estructura de la base del programa no es la de la receta: no se escribe nada."""
+
+
+class ErrorPlan(Exception):
+    """Una fila del plan no trae exactamente las columnas esperadas."""
+
+
+class ColaSinFunciones(Exception):
+    """Supabase todavía no tiene las funciones de la cola de cargas."""
+
+
+class ErrorCola(Exception):
+    """La cola de Supabase rechazó una transición (la función devolvió false)."""
+
+
+class ErrorDiario(Exception):
+    """No se pudo anotar en el diario local: sin diario no se escribe en Garro."""
+
+
+class ErrorDeshacer(Exception):
+    def __init__(self, codigo: str, mensaje: str):
+        super().__init__(mensaje)
+        self.codigo = codigo
+        self.mensaje = mensaje
+
+
+def _ahora_txt() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _verdadero(valor) -> bool:
+    """Solo un booleano verdadero cuenta: cualquier otra cosa (texto, número, NULL) se trata como falso."""
+    return valor is True
+
+
+def _corto(e: BaseException) -> str:
+    primera = (str(e).splitlines() or [""])[0]
+    return f"{type(e).__name__}: {primera}"[:240]
+
+
+# ------------------------------------------------------------------ conexión
+
+def conectar_garro(cfg: dict[str, str], solo_lectura: bool, base: str | None = None):
+    """Conexión a la base del programa. Mismas credenciales y codificación que la copia; `base` pisa GARRO_BASE."""
+    import psycopg2
+    g.validar_origen(cfg)
+    try:
+        con = psycopg2.connect(
+            host=cfg["GARRO_HOST"], port=int(cfg["GARRO_PUERTO"]), dbname=base or cfg["GARRO_BASE"],
+            user=cfg["GARRO_USUARIO"], password=cfg["GARRO_PASSWORD"],
+            connect_timeout=20, application_name="garro_sync (cargas)",
+            # Como opciones de la sesión y no con SET: un ROLLBACK deshace un SET, y estos topes tienen que
+            # valer en todas las transacciones de la conexión.
+            # Los keepalive: si la conexión se corta sin cierre limpio, el servidor suelta la sesión (y sus
+            # bloqueos) en segundos en vez de dejarla colgada frenando las grabaciones del programa.
+            options="-c lock_timeout=5s -c statement_timeout=60s -c tcp_keepalives_idle=30 -c tcp_keepalives_interval=10",
+        )
+    except UnicodeDecodeError as e:
+        raise g.ErrorSync(g.mensaje_rechazo_origen(g.decodificar_error_conexion(e))) from e
+    con.set_session(readonly=solo_lectura, autocommit=False)
+    with con.cursor() as cur:
+        cur.execute("SHOW server_encoding")
+        server_encoding = cur.fetchone()[0]
+    con.rollback()
+    encoding = cfg.get("GARRO_ENCODING") or ("WIN1252" if server_encoding == "SQL_ASCII" else server_encoding)
+    con.set_client_encoding(encoding)
+    return con
+
+
+# ------------------------------------------------------------------ estructura
+
+def verificar_estructura(cur) -> dict[str, int | None]:
+    """Las tablas que se tocan tienen EXACTAMENTE las columnas (y tipos) de la receta, sin triggers ni reglas.
+    Devuelve los largos máximos de las columnas de texto: {"tabla.columna": largo o None}."""
+    tablas = list(gc.COLUMNAS)
+    cur.execute("""SELECT table_name, column_name, character_maximum_length, data_type FROM information_schema.columns
+                   WHERE table_schema = 'public' AND table_name = ANY(%s)""", (tablas,))
+    reales: dict[str, set[str]] = {t: set() for t in tablas}
+    largos: dict[str, int | None] = {}
+    problemas = []
+    for tabla, columna, largo, tipo in cur.fetchall():
+        reales[tabla].add(columna)
+        largos[f"{tabla}.{columna}"] = largo
+        esperado = gc.TIPOS.get(tabla, {}).get(columna)
+        if esperado is not None and tipo != esperado:
+            problemas.append(f"{tabla}.{columna}: es {tipo} y se esperaba {esperado}")
+    for tabla, esperadas in gc.COLUMNAS.items():
+        if not reales[tabla]:
+            problemas.append(f"{tabla}: la tabla no existe")
+            continue
+        faltan, sobran = sorted(set(esperadas) - reales[tabla]), sorted(reales[tabla] - set(esperadas))
+        if faltan:
+            problemas.append(f"{tabla}: faltan columnas {', '.join(faltan)}")
+        if sobran:
+            problemas.append(f"{tabla}: columnas de más {', '.join(sobran)}")
+    cur.execute("""SELECT c.relname, t.tgname FROM pg_trigger t
+                   JOIN pg_class c ON c.oid = t.tgrelid JOIN pg_namespace n ON n.oid = c.relnamespace
+                   WHERE NOT t.tgisinternal AND n.nspname = 'public' AND c.relname = ANY(%s)""", (tablas,))
+    problemas += [f"{t}: tiene un trigger ({n})" for t, n in cur.fetchall()]
+    cur.execute("SELECT tablename, rulename FROM pg_rules WHERE schemaname = 'public' AND tablename = ANY(%s)", (tablas,))
+    problemas += [f"{t}: tiene una regla ({n})" for t, n in cur.fetchall()]
+    if problemas:
+        raise ErrorEstructura("La base del programa no coincide con la receta: " + "; ".join(problemas))
+    return largos
+
+
+# ------------------------------------------------------------------ referencias
+
+_MEDIOS_DE_PAGO = """
+    SELECT cp.fk_id_pago AS pago, ch.imp_cheque::numeric AS imp
+      FROM cheques_en_pagos AS cp JOIN cheques AS ch ON ch.id_cheque = cp.fk_id_cheque
+    UNION ALL
+    SELECT ep.fk_id_pago, e.imp_efectivo_medio_de_pago::numeric * coalesce(nullif(e.imp_equivalente_peso, 0), 1)::numeric
+      FROM efectivo_medio_de_pago_en_pagos AS ep
+      JOIN efectivo_medio_de_pago AS e ON e.id_efectivo_medio_de_pago = ep.fk_id_efectivo_medio_de_pago
+    UNION ALL
+    SELECT mp.fk_id_pago, mb.imp_movimiento_cuenta_bancaria::numeric
+      FROM movimientos_cuenta_bancaria_en_pagos AS mp
+      JOIN movimientos_cuentas_bancarias AS mb ON mb.id_movimiento_cuenta_bancaria = mp.fk_id_movimiento_cuenta_bancaria
+    UNION ALL
+    SELECT op.fk_id_pago, o.imp_otro_medio_de_pago::numeric
+      FROM otro_medio_de_pago_en_pagos AS op
+      JOIN otro_medio_de_pago AS o ON o.id_otro_medio_de_pago = op.fk_id_otro_medio_de_pago
+    UNION ALL
+    SELECT cpp.fk_id_pago, chp.imp_cheque_propio::numeric
+      FROM cheques_propios_en_pagos AS cpp
+      JOIN cheques_propios AS chp ON chp.id_cheque_propio = cpp.fk_id_cheque_propio
+"""
+
+_PAGOS_DEL_PROVEEDOR = f"""
+    WITH medios AS (
+      SELECT m.pago, sum(m.imp) AS imp FROM ({_MEDIOS_DE_PAGO}) AS m GROUP BY 1
+    ), imputado AS (
+      SELECT x.fk_id_pago AS pago, sum(x.imp_pago_en_comprobante_compra)::numeric AS imp
+      FROM pagos_en_comprobantes_compras AS x GROUP BY 1
+    )
+    SELECT p.id_pago, p.fec_pago, round(coalesce(medios.imp, 0) - coalesce(imputado.imp, 0), 2)
+    FROM pagos AS p
+    LEFT JOIN medios ON medios.pago = p.id_pago
+    LEFT JOIN imputado ON imputado.pago = p.id_pago
+    WHERE p.fk_id_proveedor = %s
+    ORDER BY p.id_pago
+"""
+
+
+def _fecha_de(propuesta: dict) -> date | None:
+    try:
+        return date.fromisoformat(str(propuesta.get("fecha")))
+    except ValueError:
+        return None
+
+
+def leer_referencias(cur, propuesta, ahora: datetime, cfg: dict[str, str], largos: dict[str, int | None]) -> gc.Referencias:
+    """Lo que el planificador necesita saber de la base, leído dentro de la transacción de la carga.
+    (`ahora` no se usa hoy: queda en la firma porque las referencias se leen «a esa hora».)"""
+    p = propuesta if isinstance(propuesta, dict) else {}
+
+    cur.execute("SELECT id_proveedor, cuit_proveedor, raz_soc_proveedor, nom_fan_proveedor, es_activo FROM proveedores")
+    todos = [{"id": r[0], "cuit": r[1], "razon_social": r[2], "fantasia": r[3], "activo": _verdadero(r[4])}
+             for r in cur.fetchall()]
+    proveedores = gc.proveedores_de(p, todos)
+
+    tipo = None
+    tipo_id = gc._entero(p.get("tipo_garro_id"))
+    if tipo_id is not None:
+        cur.execute("""SELECT id_tipo_comprobante_compra, des_tipo_comprobante_compra, es_ctacte
+                       FROM tipos_comprobantes_compras WHERE id_tipo_comprobante_compra = %s""", (tipo_id,))
+        fila = cur.fetchone()
+        if fila:
+            tipo = {"id": fila[0], "descripcion": fila[1], "es_ctacte": _verdadero(fila[2])}
+
+    cur.execute("SELECT id_operario FROM operarios WHERE nombre_usuario = %s AND habilitado",
+                (cfg.get("CARGAS_OPERARIO", OPERARIO_POR_DEFECTO),))
+    filas = cur.fetchall()
+    operario_id = filas[0][0] if len(filas) == 1 else None
+
+    cur.execute("SELECT fk_id_plan_de_cuenta_proveedor, fk_id_plan_de_cuenta_creditofiscal FROM planes_de_cuentas_config")
+    filas = cur.fetchall()
+    cuenta_proveedores, cuenta_credito = (filas[0][0], filas[0][1]) if len(filas) == 1 else (None, None)
+
+    cur.execute("SELECT id_plan_de_cuenta, es_activo, imputable FROM planes_de_cuentas")
+    cuentas = {r[0]: {"activa": _verdadero(r[1]), "imputable": _verdadero(r[2])} for r in cur.fetchall()}
+
+    cur.execute("SELECT id_cuenta_imputacion_item_compra FROM cuentas_imputacion_items_compras")
+    categorias = {r[0] for r in cur.fetchall()}
+
+    cur.execute("SELECT id_regimen_especial, fk_id_tipo_regimen_compra, fk_id_plan_de_cuenta FROM regimenes_especiales")
+    regimenes = {r[0]: {"tipo": r[1], "cuenta": r[2]} for r in cur.fetchall()}
+
+    duplicados: list[int] = []
+    numero = gc._entero(p.get("numero"))
+    unico = proveedores[0] if len(proveedores) == 1 else None
+    if unico is not None and numero is not None:
+        # De cualquier tipo y punto de venta: es a propósito conservador (el equipo a veces carga con otro punto).
+        cur.execute("""SELECT id_comprobante_compra FROM comprobantes_compras
+                       WHERE estado_comprobante_compra = 'activo' AND fk_id_proveedor = %s
+                         AND nro_comprobante_compra = %s ORDER BY 1""", (unico["id"], numero))
+        duplicados = [r[0] for r in cur.fetchall()]
+
+    siguiente_grupo = None
+    fecha = _fecha_de(p)
+    if fecha is not None:
+        desde = datetime(fecha.year, fecha.month, 1)
+        hasta = datetime(fecha.year + (fecha.month == 12), fecha.month % 12 + 1, 1)
+        cur.execute("""SELECT coalesce(max(nro_grupo_asiento_contable), 0) + 1 FROM asientos_contables
+                       WHERE fec_asiento_contable >= %s AND fec_asiento_contable < %s""", (desde, hasta))
+        siguiente_grupo = cur.fetchone()[0]
+
+    pagos_a_cuenta: list[dict] = []
+    if tipo is not None and tipo["es_ctacte"] and unico is not None:
+        medios_sin_contemplar = g.contar_sin_copiar(cur)
+        if medios_sin_contemplar:
+            raise gc.NoCargable(
+                "medios_sin_contemplar",
+                "En el programa se usan medios de pago que la carga no contempla ("
+                + ", ".join(sorted(medios_sin_contemplar)) + "): los restos de los pagos saldrían mal.")
+        cur.execute("SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+                    "WHERE n.nspname = 'public' AND c.relkind = 'r' AND c.relname = 'notas_creditos_compras_en_pagos'")
+        if cur.fetchone() is None:
+            raise ErrorEstructura("La base del programa no coincide con la receta: falta la tabla notas_creditos_compras_en_pagos.")
+        cur.execute("""SELECT count(*) FROM notas_creditos_compras_en_pagos AS n
+                       JOIN pagos AS p ON p.id_pago = n.fk_id_pago WHERE p.fk_id_proveedor = %s""", (unico["id"],))
+        if cur.fetchone()[0]:
+            raise gc.NoCargable("medios_sin_contemplar",
+                                "El proveedor tiene pagos con notas de crédito aplicadas, que la carga no contempla: "
+                                "los restos de los pagos saldrían mal.")
+        cur.execute(_PAGOS_DEL_PROVEEDOR, (unico["id"],))
+        for pago, fec_pago, resto in cur.fetchall():
+            resto = gc.r2(float(resto))
+            if resto > 0:
+                pagos_a_cuenta.append({"id": pago, "fecha": fec_pago, "resto": resto})
+
+    return gc.Referencias(
+        proveedores=proveedores, tipo=tipo, operario_id=operario_id, cuenta_proveedores=cuenta_proveedores,
+        cuenta_credito_fiscal=cuenta_credito, cuentas=cuentas, categorias=categorias, regimenes=regimenes,
+        duplicados=duplicados, siguiente_grupo=siguiente_grupo, pagos_a_cuenta=pagos_a_cuenta, largos=dict(largos))
+
+
+# ------------------------------------------------------------------ escritura
+
+def _insertar(cur, tabla: str, fila: dict, **claves) -> int:
+    """INSERT con lista explícita de columnas. La fila del plan más las claves foráneas tienen que dar
+    EXACTAMENTE las columnas de la receta (menos la clave primaria, que sale de la secuencia)."""
+    repetidas = set(fila) & set(claves)
+    if repetidas:
+        raise ErrorPlan(f"{tabla}: el plan ya trae {', '.join(sorted(repetidas))}")
+    completa = {**fila, **claves}
+    pk, *columnas = gc.COLUMNAS[tabla]
+    if set(completa) != set(columnas):
+        faltan, sobran = sorted(set(columnas) - set(completa)), sorted(set(completa) - set(columnas))
+        raise ErrorPlan(f"{tabla}: el plan no coincide con la receta (faltan {faltan}, de más {sobran})")
+    cur.execute(f'INSERT INTO public."{tabla}" ({", ".join(columnas)}) VALUES ({", ".join(["%s"] * len(columnas))}) '
+                f"RETURNING {pk}", [completa[c] for c in columnas])
+    return cur.fetchone()[0]
+
+
+def escribir(cur, plan: gc.Plan) -> dict:
+    """Escribe el plan completo (sin commit) y devuelve los ids creados por tabla."""
+    escrito: dict[str, list[int]] = {t: [] for t in TABLAS_ESCRITO}
+    comprobante = _insertar(cur, "comprobantes_compras", plan.comprobante)
+    escrito["comprobantes_compras"].append(comprobante)
+    for item in plan.items:
+        id_item = _insertar(cur, "items_comprobantes_compras", item["fila"], fk_id_comprobante_compra=comprobante)
+        id_concepto = _insertar(cur, "conceptos_compras", {"des_concepto_compra": item["concepto"]})
+        id_cxi = _insertar(cur, "conceptos_x_items_comprobantes_compras", {},
+                           fk_id_item_comprobante_compra=id_item, fk_id_concepto_compra=id_concepto)
+        escrito["items_comprobantes_compras"].append(id_item)
+        escrito["conceptos_compras"].append(id_concepto)
+        escrito["conceptos_x_items_comprobantes_compras"].append(id_cxi)
+    for regimen in plan.regimenes:
+        escrito["regimenes_especiales_x_comprobantes_compras"].append(
+            _insertar(cur, "regimenes_especiales_x_comprobantes_compras", regimen, fk_id_comprobante_compra=comprobante))
+    if plan.asiento:
+        asiento = _insertar(cur, "asientos_contables", plan.asiento["fila"], fk_id_comprobante_compra=comprobante)
+        escrito["asientos_contables"].append(asiento)
+        for mov in plan.asiento["movimientos"]:
+            escrito["asientos_contables_movimientos"].append(
+                _insertar(cur, "asientos_contables_movimientos", mov, fk_id_asiento_contable=asiento))
+    for imputacion in plan.imputaciones:
+        escrito["pagos_en_comprobantes_compras"].append(
+            _insertar(cur, "pagos_en_comprobantes_compras", imputacion, fk_id_comprobante_compra=comprobante))
+    return escrito
+
+
+def _ids_hijos(cur, comprobante_id: int) -> dict[str, list[int]]:
+    """Lo que HOY cuelga del comprobante, con las mismas claves que `escrito` (listas ordenadas)."""
+    def ids(sql: str, *params) -> list[int]:
+        cur.execute(sql, params)
+        return sorted(r[0] for r in cur.fetchall())
+
+    items = ids("SELECT id_item_comprobante_compra FROM items_comprobantes_compras WHERE fk_id_comprobante_compra = %s",
+                comprobante_id)
+    cur.execute("""SELECT id_concepto_x_item_comprobante_compra, fk_id_concepto_compra
+                   FROM conceptos_x_items_comprobantes_compras WHERE fk_id_item_comprobante_compra = ANY(%s)""", (items,))
+    cxi = cur.fetchall()
+    asientos = ids("SELECT id_asiento_contable FROM asientos_contables WHERE fk_id_comprobante_compra = %s", comprobante_id)
+    return {
+        "comprobantes_compras": ids("SELECT id_comprobante_compra FROM comprobantes_compras "
+                                    "WHERE id_comprobante_compra = %s", comprobante_id),
+        "items_comprobantes_compras": items,
+        "conceptos_compras": sorted(r[1] for r in cxi),
+        "conceptos_x_items_comprobantes_compras": sorted(r[0] for r in cxi),
+        "regimenes_especiales_x_comprobantes_compras": ids(
+            "SELECT id_regimen_especial_x_comprobante_compra FROM regimenes_especiales_x_comprobantes_compras "
+            "WHERE fk_id_comprobante_compra = %s", comprobante_id),
+        "asientos_contables": asientos,
+        "asientos_contables_movimientos": ids(
+            "SELECT id_asiento_contable_movimiento FROM asientos_contables_movimientos "
+            "WHERE fk_id_asiento_contable = ANY(%s)", asientos),
+        "pagos_en_comprobantes_compras": ids(
+            "SELECT id_pago_en_comprobante_compra FROM pagos_en_comprobantes_compras WHERE fk_id_comprobante_compra = %s",
+            comprobante_id),
+    }
+
+
+def _centavos(x) -> int:
+    """Importe en centavos enteros (nunca se compara un float contra 0,01)."""
+    return int(round(float(x) * 100))
+
+
+def comparar_asiento(plan: gc.Plan, leidos: list[tuple]) -> None:
+    """`leidos`: (cuenta, es_haber, importe) de los movimientos releídos, en orden por id. Tienen que ser
+    EXACTAMENTE los del plan (cuenta, lado e importe en centavos, en el mismo orden) y el asiento tiene que cerrar."""
+    esperados = [(m["fk_id_plan_de_cuenta"], bool(m["es_haber"]), _centavos(m["imp_asiento_contable_movimiento"]))
+                 for m in plan.asiento["movimientos"]]
+    reales = [(cuenta, haber is True, _centavos(importe)) for cuenta, haber, importe in leidos]
+    if reales != esperados:
+        raise AssertionError("Los movimientos del asiento releídos no coinciden con los del plan.")
+    haber = sum(c for _, es_haber, c in reales if es_haber)
+    debe = sum(c for _, es_haber, c in reales if not es_haber)
+    if debe != haber:
+        raise AssertionError(f"El asiento no cierra: debe {debe / 100:.2f}, haber {haber / 100:.2f}.")
+    if haber != esperados[0][2]:
+        raise AssertionError("El haber del asiento no es el del plan.")
+
+
+def verificar_escrito(cur, plan: gc.Plan, escrito: dict) -> None:
+    """Relee lo escrito (misma transacción, antes del COMMIT) y comprueba que cierra. Si no: excepción → ROLLBACK."""
+    cid = escrito["comprobantes_compras"][0]
+    hijos = _ids_hijos(cur, cid)
+    for tabla in TABLAS_ESCRITO:
+        if hijos[tabla] != sorted(escrito[tabla]):
+            raise AssertionError(f"Lo escrito en {tabla} no coincide con lo que quedó en la base.")
+    if len(hijos["items_comprobantes_compras"]) != len(plan.items):
+        raise AssertionError("La cantidad de renglones escritos no coincide con el plan.")
+
+    cur.execute("""SELECT coalesce(sum(i.can_item_comprobante_compra::numeric * i.imp_neto_item_comprobante_compra::numeric
+                                * (1 + i.porc_desc_item_comprobante_compra::numeric / 100)
+                                * (1 + c.porc_desc_comprobante_compra::numeric / 100)
+                                * (1 + i.porc_iva_item_comprobante_compra::numeric / 100)), 0)
+                   FROM comprobantes_compras AS c
+                   JOIN items_comprobantes_compras AS i ON i.fk_id_comprobante_compra = c.id_comprobante_compra
+                   WHERE c.id_comprobante_compra = %s""", (cid,))
+    lineas = float(cur.fetchone()[0])
+    cur.execute("""SELECT coalesce(sum(imp_regimen_especial_x_comprobante_compra::numeric), 0)
+                   FROM regimenes_especiales_x_comprobantes_compras WHERE fk_id_comprobante_compra = %s""", (cid,))
+    total = _centavos(lineas + float(cur.fetchone()[0]))
+    if abs(total - _centavos(plan.total)) > 1:
+        raise AssertionError(f"El total releído ({total / 100:.2f}) no coincide con el plan ({plan.total:.2f}).")
+
+    if plan.asiento:
+        cur.execute("""SELECT fk_id_plan_de_cuenta, es_haber, imp_asiento_contable_movimiento
+                       FROM asientos_contables_movimientos WHERE fk_id_asiento_contable = ANY(%s)
+                       ORDER BY id_asiento_contable_movimiento""", (hijos["asientos_contables"],))
+        comparar_asiento(plan, cur.fetchall())
+    elif hijos["asientos_contables"] or hijos["asientos_contables_movimientos"]:
+        raise AssertionError("Se escribió un asiento que el plan no tenía.")
+
+    cur.execute("""SELECT coalesce(sum(imp_pago_en_comprobante_compra::numeric), 0)
+                   FROM pagos_en_comprobantes_compras WHERE fk_id_comprobante_compra = %s""", (cid,))
+    if _centavos(cur.fetchone()[0]) > total + 1:
+        raise AssertionError("Las imputaciones de pagos superan el total del comprobante.")
+
+
+def huella(cur, escrito: dict) -> str:
+    """sha256 del contenido de TODAS las filas escritas (columnas de la receta, orden estable por id). Si una
+    persona toca cualquiera en el programa, la huella cambia."""
+    partes = []
+    for tabla in TABLAS_ESCRITO:
+        pk, *_ = gc.COLUMNAS[tabla]
+        cur.execute(f'SELECT {", ".join(gc.COLUMNAS[tabla])} FROM public."{tabla}" WHERE {pk} = ANY(%s) ORDER BY {pk}',
+                    (sorted(escrito[tabla]),))
+        partes.append([tabla, [[repr(v) for v in fila] for fila in cur.fetchall()]])
+    return hashlib.sha256(json.dumps(partes, ensure_ascii=True).encode("ascii")).hexdigest()
+
+
+# ------------------------------------------------------------------ diario local
+
+def _base_de(cfg: dict[str, str], base: str | None) -> str:
+    return base or cfg.get("GARRO_BASE", "")
+
+
+def diario_escribir(evento: str, carga: dict, base: str, **datos) -> None:
+    """Una línea JSON por evento. Nunca guarda la propuesta: solo clave, total y los ids escritos."""
+    linea = {"hora": datetime.now().isoformat(timespec="seconds"), "carga": carga.get("id"),
+             "clave": carga.get("clave"), "base": base, "evento": evento, **datos}
+    with open(DIARIO, "a", encoding="utf-8") as f:
+        f.write(json.dumps(linea, ensure_ascii=False, default=str) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def diario_ultimo(carga_id, eventos: tuple[str, ...], base: str) -> dict | None:
+    """Último evento del diario (de los pedidos) de esa carga en ESA base, o None."""
+    ultimo = None
+    try:
+        with open(DIARIO, encoding="utf-8") as f:
+            for linea in f:
+                try:
+                    d = json.loads(linea)
+                except ValueError:
+                    continue
+                if (isinstance(d, dict) and d.get("carga") == carga_id and d.get("base") == base
+                        and d.get("evento") in eventos):
+                    ultimo = d
+    except OSError:
+        return None
+    return ultimo
+
+
+# ------------------------------------------------------------------ cargar una
+
+MOTIVO_CONEXION = "No se pudo conectar con Gestión Integral o se cortó la conexión; el detalle está en el log local."
+MOTIVO_OCUPADO = "Gestión Integral estaba ocupado (tablas bloqueadas o consulta demasiado lenta); se reintenta."
+
+
+def _es_de_conexion(e: BaseException) -> bool:
+    try:
+        import psycopg2
+    except ImportError:
+        return isinstance(e, g.ErrorSync)
+    return isinstance(e, (g.ErrorSync, psycopg2.OperationalError, psycopg2.InterfaceError))
+
+
+def _resultado_de_excepcion(e: BaseException) -> dict:
+    """Una excepción ANTES del COMMIT (ya hecho el ROLLBACK, nada quedó escrito) como resultado para la cola.
+    Lo transitorio vuelve a la cola (`pendiente`); lo demás es un error. El texto de un error de conexión
+    nunca sale de la PC (puede traer el host): el detalle queda en el log local."""
+    pgcode = getattr(e, "pgcode", None)
+    if pgcode in ("55P03", "57014"):  # lock_timeout / statement_timeout
+        return {"estado": "pendiente", "codigo": "ocupado", "motivo": MOTIVO_OCUPADO}
+    if _es_de_conexion(e):
+        return {"estado": "pendiente", "codigo": "sin_conexion", "motivo": MOTIVO_CONEXION}
+    return {"estado": "error", "codigo": "excepcion", "motivo": _corto(e)}
+
+
+def _buscar_lo_propio(cfg: dict[str, str], propuesta: dict, base: str | None) -> tuple[int | None, bool]:
+    """Para una retomada: ¿el bot ya escribió este comprobante? Consulta mínima, de solo lectura y sin LOCK, que no
+    depende de ninguna guarda. Devuelve (id o None, conclusiva): `conclusiva` es False si no se pudo saber."""
+    con = conectar_garro(cfg, solo_lectura=True, base=base)
+    try:
+        cur = con.cursor()
+        cur.execute("SELECT id_operario FROM operarios WHERE nombre_usuario = %s AND habilitado",
+                    (cfg.get("CARGAS_OPERARIO", OPERARIO_POR_DEFECTO),))
+        operarios = cur.fetchall()
+        cur.execute("SELECT id_proveedor, cuit_proveedor, raz_soc_proveedor, nom_fan_proveedor, es_activo FROM proveedores")
+        todos = [{"id": r[0], "cuit": r[1], "razon_social": r[2], "fantasia": r[3], "activo": r[4]} for r in cur.fetchall()]
+        proveedores = gc.proveedores_de(propuesta, todos)
+        numero = gc._entero(propuesta.get("numero"))
+        if len(operarios) != 1 or len(proveedores) != 1 or numero is None:
+            return None, False
+        cur.execute("""SELECT id_comprobante_compra FROM comprobantes_compras
+                       WHERE estado_comprobante_compra = 'activo' AND fk_id_proveedor = %s
+                         AND nro_comprobante_compra = %s AND fk_id_operario = %s ORDER BY 1""",
+                    (proveedores[0]["id"], numero, operarios[0][0]))
+        filas = cur.fetchall()
+        if len(filas) > 1:
+            return None, False
+        return (filas[0][0] if filas else None), True
+    finally:
+        con.close()
+
+
+def _incierta(resultado: dict, retomada: bool) -> dict:
+    """En una retomada, lo que no sea «escrita ahora» ni un rechazo posterior a una búsqueda concluyente no se
+    resuelve: no se sabe si quedó algo escrito."""
+    if retomada and resultado["estado"] in ("error", "pendiente"):
+        return {**resultado, "estado": "indeterminado"}
+    return resultado
+
+
+def cargar_una(cfg: dict[str, str], carga: dict, en_seco: bool, ahora: datetime | None = None,
+               base: str | None = None) -> dict:
+    """Planifica y, si no es en seco, escribe UN comprobante. Devuelve el resultado para la cola:
+    simulada / cargada / rechazada / error / pendiente (vuelve a la cola: se sabe que no se escribió nada).
+    «indeterminado» significa que no se pudo saber si quedó algo escrito: la carga no se resuelve y la próxima
+    pasada la recibe como retomada."""
+    ahora = ahora or datetime.now()
+    payload = carga.get("payload") if isinstance(carga.get("payload"), dict) else {}
+    propuesta = payload.get("propuesta") if isinstance(payload.get("propuesta"), dict) else {}
+    nombre_base = _base_de(cfg, base)
+    # Una retomada de una carga real puede haber escrito antes de cortarse: LO PRIMERO es buscar lo propio,
+    # aunque ahora la escritura esté apagada en esta instalación (si no, quedaría como rechazada por «ya cargado»
+    # algo que cargó el bot). Una carga en seco nunca escribió nada: no busca y se simula normal.
+    retomada_real = bool(carga.get("retomada")) and carga.get("modo") == "real"
+    retomada = retomada_real and not en_seco
+
+    if retomada_real:
+        try:
+            existente, conclusiva = _buscar_lo_propio(cfg, propuesta, base)
+        except Exception as e:
+            g.escribir_traza()
+            g.decir(f"{_ahora_txt()} (cargas) carga {carga.get('id')}: no se pudo buscar lo ya escrito: {_corto(e)}")
+            return {"estado": "indeterminado", "codigo": "busqueda_fallida",
+                    "motivo": "No se pudo comprobar si la carga ya estaba escrita; el detalle está en el log local."}
+        if existente is not None:
+            previo = diario_ultimo(carga.get("id"), ("cargada",), nombre_base)
+            return {"estado": "cargada", "comprobante_id": existente, "recuperada": True,
+                    "escrito": previo.get("escrito") if previo else None}
+        if not conclusiva:
+            return {"estado": "indeterminado", "codigo": "busqueda_inconclusa",
+                    "motivo": "No se pudo comprobar si la carga ya estaba escrita (usuario del bot o proveedor no únicos)."}
+        if (diario_ultimo(carga.get("id"), ("cargada", "deshecha"), nombre_base) or {}).get("evento") == "cargada":
+            # El diario dice que esta carga SÍ se escribió y ahora no está: alguien la anuló en el programa.
+            # No se vuelve a escribir algo que una persona decidió borrar: queda para revisar.
+            return {"estado": "indeterminado", "codigo": "escrita_y_ya_no_esta",
+                    "motivo": "La carga figura como escrita en el diario local y el comprobante ya no está en el programa."}
+
+    con = None
+    en_commit = False
+    try:
+        con = conectar_garro(cfg, solo_lectura=en_seco, base=base)
+        cur = con.cursor()
+        largos = verificar_estructura(cur)
+        if not en_seco:
+            # Con las tablas bloqueadas, ni los duplicados, ni los restos de los pagos ni el número de asiento
+            # cambian hasta el COMMIT.
+            cur.execute(LOCK_TABLAS)
+        ref = leer_referencias(cur, propuesta, ahora, cfg, largos)
+        plan = gc.planificar(payload, ref, ahora)
+        if en_seco:
+            con.rollback()
+            return {"estado": "simulada", "plan": plan.resumen()}
+
+        try:
+            diario_escribir("intento", carga, nombre_base, total=gc.r2(plan.total))
+        except OSError as e:
+            raise ErrorDiario(f"No se pudo anotar en el diario local: {e}") from e
+        escrito = escribir(cur, plan)
+        verificar_escrito(cur, plan, escrito)
+        escrito["huella"] = huella(cur, escrito)
+        en_commit = True
+        con.commit()
+        en_commit = False
+        try:
+            diario_escribir("cargada", carga, nombre_base, escrito=escrito)
+        except OSError:
+            g.escribir_traza()
+            g.decir(f"{_ahora_txt()} (cargas) AVISO: no se pudo anotar en el diario local la carga {carga.get('id')}.")
+        return {"estado": "cargada", "comprobante_id": escrito["comprobantes_compras"][0],
+                "escrito": escrito, "plan": plan.resumen()}
+    except gc.NoCargable as e:
+        _rollback(con)
+        return {"estado": "rechazada", "codigo": e.codigo, "motivo": e.mensaje}
+    except ErrorEstructura as e:
+        _rollback(con)
+        return _incierta({"estado": "error", "codigo": "estructura", "motivo": str(e)[:500]}, retomada)
+    except Exception as e:
+        g.escribir_traza()
+        g.decir(f"{_ahora_txt()} (cargas) carga {carga.get('id')}: {_corto(e)}")
+        if en_commit:
+            return {"estado": "indeterminado", "codigo": "commit_incierto",
+                    "motivo": "No se pudo confirmar si el COMMIT se hizo; el detalle está en el log local."}
+        _rollback(con)
+        return _incierta(_resultado_de_excepcion(e), retomada)
+    finally:
+        if con is not None:
+            try:
+                con.close()
+            except Exception:
+                pass
+
+
+def _rollback(con) -> None:
+    if con is not None:
+        try:
+            con.rollback()
+        except Exception:
+            pass
+
+
+# ------------------------------------------------------------------ cola en Supabase
+
+def _destino(cfg: dict[str, str], sql: str, params: tuple = ()):
+    """Una llamada corta a Supabase en su propia conexión y transacción."""
+    con = g.conectar_destino(cfg)
+    try:
+        with con.cursor() as cur:
+            cur.execute(sql, params)
+            fila = cur.fetchone()
+        con.commit()
+        return fila[0] if fila else None
+    except Exception as e:
+        if getattr(e, "pgcode", None) in ("42883", "3F000"):  # función o schema inexistente
+            raise ColaSinFunciones() from e
+        raise
+    finally:
+        con.close()
+
+
+def cola_tomar(cfg: dict[str, str]) -> dict | None:
+    return _destino(cfg, "SELECT garro.cargas_tomar()")
+
+
+def cola_resolver(cfg: dict[str, str], carga_id: int, estado: str, resultado: dict) -> None:
+    """Resuelve la carga en la cola. La función devuelve true si la transición es válida: cualquier otra cosa
+    (false, NULL) es un error y la carga NO queda resuelta."""
+    ok = _destino(cfg, "SELECT garro.cargas_resolver(%s, %s, %s::jsonb)",
+                  (carga_id, estado, json.dumps(resultado, ensure_ascii=False, default=str)))
+    if ok is not True:
+        raise ErrorCola(f"La cola no aceptó pasar la carga {carga_id} a «{estado}».")
+
+
+def cola_leer(cfg: dict[str, str], carga_id: int) -> dict | None:
+    return _destino(cfg, "SELECT garro.cargas_leer(%s)", (carga_id,))
+
+
+# ------------------------------------------------------------------ candado y pasada
+
+def tomar_lock(ruta: str):
+    """Candado del sistema operativo sobre un archivo abierto durante toda la pasada (mismo patrón que el
+    relevamiento): si el proceso muere, el sistema lo suelta solo. Devuelve el archivo o None si está tomado."""
+    f = open(ruta, "a+b")
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+            f.seek(0, os.SEEK_END)
+            if f.tell() == 0:
+                f.write(b"0")
+                f.flush()
+            f.seek(0)
+            pedir = lambda: msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)  # noqa: E731
+            ocupado = (errno.EACCES, errno.EDEADLK, 36)
+        else:
+            import fcntl
+            pedir = lambda: fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)  # noqa: E731
+            ocupado = (errno.EAGAIN, errno.EWOULDBLOCK, errno.EACCES)
+        try:
+            pedir()
+        except OSError as e:
+            if e.errno in ocupado:
+                f.close()
+                return None
+            raise
+    except BaseException:
+        f.close()
+        raise
+    return f
+
+
+def soltar_lock(f) -> None:
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+    finally:
+        f.close()
+
+
+def _cargas_por_pasada(cfg: dict[str, str]) -> int:
+    try:
+        n = int(cfg.get("CARGAS_POR_PASADA", "").strip() or POR_PASADA_DEFECTO)
+    except ValueError:
+        n = POR_PASADA_DEFECTO
+    return max(1, min(n, POR_PASADA_MAXIMO))
+
+
+def _linea_de_log(carga_id, resultado: dict) -> str:
+    codigo = f" ({resultado['codigo']})" if resultado.get("codigo") else ""
+    extra = " [recuperada]" if resultado.get("recuperada") else ""
+    return f"{_ahora_txt()} (cargas) carga {carga_id}: {resultado['estado']}{codigo}{extra}"
+
+
+def pasada(cfg: dict[str, str]) -> None:
+    """Procesa hasta CARGAS_POR_PASADA cargas de la cola. Apagada salvo CARGAS=1. Una sola pasada a la vez."""
+    if cfg.get("CARGAS", "0").strip() != "1":
+        return
+    lock = tomar_lock(ARCHIVO_LOCK)
+    if lock is None:
+        return
+    try:
+        real_permitido = cfg.get("CARGAS_REAL", "0").strip() == "1"
+        for _ in range(_cargas_por_pasada(cfg)):
+            try:
+                carga = cola_tomar(cfg)
+            except ColaSinFunciones:
+                g.decir(f"{_ahora_txt()} (cargas) Supabase todavía no tiene la cola de cargas; no se hace nada.")
+                return
+            if not carga:
+                return
+            es_real = carga.get("modo") == "real"
+            en_seco = not (es_real and real_permitido)
+            resultado = cargar_una(cfg, carga, en_seco=en_seco)
+            if es_real and en_seco and resultado.get("estado") == "simulada":
+                resultado["aviso"] = "la escritura real está apagada en esta instalación"
+            g.decir(_linea_de_log(carga.get("id"), resultado))
+            if resultado["estado"] == "indeterminado":
+                return  # sin resolver: la próxima pasada la recibe como retomada y busca si quedó escrita
+            try:
+                cola_resolver(cfg, carga["id"], resultado["estado"], resultado)
+            except Exception as e:
+                # Si ya se escribió en Garro NO se reintenta escribir: la próxima pasada la recupera como retomada.
+                g.escribir_traza(limitar=True)
+                g.decir(f"{_ahora_txt()} (cargas) ERROR al resolver la carga {carga.get('id')} en Supabase: {_corto(e)}")
+                return
+            if resultado["estado"] == "pendiente":
+                return  # volvió a la cola: no se la vuelve a tomar en esta misma pasada
+    finally:
+        soltar_lock(lock)
+
+
+# ------------------------------------------------------------------ deshacer
+
+# Columnas de otras tablas que apuntan a lo que escribimos: qué ids de nuestras tablas apuntan.
+COLUMNAS_QUE_APUNTAN = {
+    "fk_id_comprobante_compra": "comprobantes_compras",
+    "fk_id_item_comprobante_compra": "items_comprobantes_compras",
+    "fk_id_asiento_contable": "asientos_contables",
+    "fk_id_concepto_compra": "conceptos_compras",
+}
+
+
+def _escrito_de_la_carga(cfg: dict[str, str], carga_id, copia: str | None) -> dict:
+    """`escrito` de una carga ya cargada. En la base real manda la cola (tiene que responder y decir «cargada»;
+    sin diario de reemplazo). En una copia nunca se toca la cola: se usa el diario, solo las entradas de esa base."""
+    if copia is not None:
+        ultimo = diario_ultimo(carga_id, ("cargada", "deshecha"), copia)
+        if ultimo is None:
+            raise ErrorDeshacer("sin_escrito", f"No hay registro de la carga {carga_id} en la base {copia}.")
+        if ultimo["evento"] == "deshecha":
+            raise ErrorDeshacer("ya_deshecha", f"La carga {carga_id} ya está deshecha.")
+        if not isinstance(ultimo.get("escrito"), dict):
+            raise ErrorDeshacer("sin_escrito", f"El diario no tiene lo escrito por la carga {carga_id}.")
+        return ultimo["escrito"]
+    try:
+        fila = cola_leer(cfg, carga_id)
+    except Exception as e:
+        g.escribir_traza()
+        g.decir(f"{_ahora_txt()} (cargas) deshacer: la cola no respondió: {_corto(e)}")
+        raise ErrorDeshacer("cola_no_responde", "La cola de Supabase no respondió: no se deshace nada "
+                                                "sin saber en qué estado está la carga.") from None
+    if not isinstance(fila, dict):
+        raise ErrorDeshacer("sin_carga", f"No existe la carga {carga_id} en la cola.")
+    if fila.get("estado") == "deshecha":
+        raise ErrorDeshacer("ya_deshecha", f"La carga {carga_id} ya está deshecha.")
+    if fila.get("estado") != "cargada":
+        raise ErrorDeshacer("no_cargada", f"La carga {carga_id} no está cargada (estado: {fila.get('estado')}).")
+    resultado = fila.get("resultado")
+    if isinstance(resultado, dict) and isinstance(resultado.get("escrito"), dict):
+        return resultado["escrito"]
+    ultimo = diario_ultimo(carga_id, ("cargada", "deshecha"), _base_de(cfg, None))
+    if ultimo and ultimo["evento"] == "cargada" and isinstance(ultimo.get("escrito"), dict):
+        return ultimo["escrito"]
+    raise ErrorDeshacer("sin_escrito", f"No hay registro de qué se escribió para la carga {carga_id}.")
+
+
+def _normalizar_escrito(escrito: dict) -> dict:
+    salida: dict = {}
+    for tabla in TABLAS_ESCRITO:
+        lista = escrito.get(tabla, [])
+        if not isinstance(lista, list) or not all(isinstance(x, int) and not isinstance(x, bool) for x in lista):
+            raise ErrorDeshacer("escrito_invalido", f"El registro de lo escrito no es válido ({tabla}).")
+        salida[tabla] = sorted(lista)
+    if len(salida["comprobantes_compras"]) != 1:
+        raise ErrorDeshacer("escrito_invalido", "El registro de lo escrito no tiene un único comprobante.")
+    if not isinstance(escrito.get("huella"), str) or not escrito["huella"]:
+        raise ErrorDeshacer("escrito_invalido", "El registro de lo escrito no trae la huella de su contenido.")
+    salida["huella"] = escrito["huella"]
+    return salida
+
+
+def _comillas(nombre: str) -> str:
+    return '"' + nombre.replace('"', '""') + '"'
+
+
+def _filas_colgadas(cur, escrito: dict) -> list[str]:
+    """Tablas del programa (cualquiera que tenga una columna que apunte a lo que escribimos) con filas colgadas
+    que NO escribimos nosotros: por ejemplo un producto vinculado al renglón o una nota de crédito aplicada."""
+    cur.execute("""SELECT c.table_name, c.column_name FROM information_schema.columns AS c
+                   JOIN information_schema.tables AS t ON t.table_schema = c.table_schema AND t.table_name = c.table_name
+                   WHERE c.table_schema = 'public' AND t.table_type = 'BASE TABLE' AND c.column_name = ANY(%s)
+                   ORDER BY 1, 2""", (list(COLUMNAS_QUE_APUNTAN),))
+    colgadas = []
+    for tabla, columna in cur.fetchall():
+        ids = escrito[COLUMNAS_QUE_APUNTAN[columna]]
+        if not ids:
+            continue
+        sql = f"SELECT count(*) FROM public.{_comillas(tabla)} WHERE {_comillas(columna)} = ANY(%s)"
+        params: list = [ids]
+        if tabla in gc.COLUMNAS:  # las filas propias no cuentan
+            pk = gc.COLUMNAS[tabla][0]
+            sql += f" AND {pk} <> ALL(%s)"
+            params.append(escrito[tabla] or [0])
+        cur.execute(sql, params)
+        if cur.fetchone()[0]:
+            colgadas.append(f"{tabla}.{columna}")
+    return colgadas
+
+
+def deshacer(cfg: dict[str, str], carga_id, confirmar: bool, base: str | None = None) -> dict:
+    """Borra lo que escribió una carga, solo si sigue EXACTAMENTE como se escribió (mismos ids y misma huella de
+    contenido) y nada más cuelga de ello. Sin `confirmar` solo informa (sesión de solo lectura, sin bloqueos).
+    Sin `base` la carga se busca en la cola; con `base` (una copia) nunca se toca la cola: manda el diario."""
+    copia = base if base and base != cfg.get("GARRO_BASE") else None
+    nombre_base = _base_de(cfg, copia)
+    con = None
+    try:
+        escrito = _normalizar_escrito(_escrito_de_la_carga(cfg, carga_id, copia))
+        con = conectar_garro(cfg, solo_lectura=not confirmar, base=copia)
+        cur = con.cursor()
+        verificar_estructura(cur)
+        if confirmar:
+            cur.execute(LOCK_TABLAS)
+        cid = escrito["comprobantes_compras"][0]
+        cur.execute("SELECT estado_comprobante_compra, fk_id_operario FROM comprobantes_compras "
+                    "WHERE id_comprobante_compra = %s", (cid,))
+        fila = cur.fetchone()
+        if fila is None:
+            raise ErrorDeshacer("no_existe", f"El comprobante {cid} ya no existe en el programa.")
+        cur.execute("SELECT id_operario FROM operarios WHERE nombre_usuario = %s AND habilitado",
+                    (cfg.get("CARGAS_OPERARIO", OPERARIO_POR_DEFECTO),))
+        operarios = cur.fetchall()
+        if fila[0] != "activo":
+            raise ErrorDeshacer("no_activo", f"El comprobante {cid} no está activo.")
+        if len(operarios) != 1 or fila[1] != operarios[0][0]:
+            raise ErrorDeshacer("no_es_del_bot", f"El comprobante {cid} no lo cargó el usuario del bot.")
+        hijos = _ids_hijos(cur, cid)
+        for tabla in TABLAS_ESCRITO:
+            if hijos[tabla] != escrito[tabla]:
+                raise ErrorDeshacer("modificado", f"El comprobante {cid} fue modificado en el programa "
+                                                  f"({tabla}): anularlo desde el programa.")
+        if huella(cur, escrito) != escrito["huella"]:
+            raise ErrorDeshacer("modificado", f"El comprobante {cid} fue modificado en el programa "
+                                              "(cambió el contenido de alguna fila): anularlo desde el programa.")
+        colgadas = _filas_colgadas(cur, escrito)
+        if colgadas:
+            raise ErrorDeshacer("dependencias", f"Hay filas de otras tablas colgadas del comprobante {cid} "
+                                                f"({', '.join(colgadas)}): anularlo desde el programa.")
+        borraria = {t: len(escrito[t]) for t in TABLAS_ESCRITO}
+        if not confirmar:
+            con.rollback()
+            return {"estado": "sin_confirmar", "comprobante_id": cid, "borraria": borraria}
+
+        for tabla in reversed(TABLAS_ESCRITO):
+            ids = escrito[tabla]
+            if not ids:
+                continue
+            cur.execute(f'DELETE FROM public."{tabla}" WHERE {gc.COLUMNAS[tabla][0]} = ANY(%s)', (ids,))
+            if cur.rowcount != len(ids):
+                raise AssertionError(f"Se esperaba borrar {len(ids)} filas de {tabla} y se borraron {cur.rowcount}.")
+        con.commit()
+        resultado = {"estado": "deshecha", "comprobante_id": cid, "borrado": borraria}
+        try:
+            diario_escribir("deshecha", {"id": carga_id, "clave": None}, nombre_base, escrito=escrito)
+        except OSError:
+            g.decir(f"{_ahora_txt()} (cargas) AVISO: no se pudo anotar en el diario local la carga {carga_id} deshecha.")
+        if copia is None:
+            aviso = f"borrado en Garro; la cola NO quedó actualizada: carga {carga_id}"
+            try:
+                cola_resolver(cfg, carga_id, "deshecha", resultado)
+            except Exception as e:
+                g.escribir_traza()
+                g.decir(f"{_ahora_txt()} (cargas) {aviso} ({_corto(e)})")
+                resultado["aviso"] = aviso
+                try:
+                    diario_escribir("cola_sin_actualizar", {"id": carga_id, "clave": None}, nombre_base)
+                except OSError:
+                    pass
+        return resultado
+    except ErrorDeshacer as e:
+        _rollback(con)
+        return {"estado": "rechazada", "codigo": e.codigo, "motivo": e.mensaje}
+    except ErrorEstructura as e:
+        _rollback(con)
+        return {"estado": "error", "codigo": "estructura", "motivo": str(e)[:500]}
+    except Exception as e:
+        g.escribir_traza()
+        g.decir(f"{_ahora_txt()} (cargas) deshacer {carga_id}: {_corto(e)}")
+        _rollback(con)
+        if _es_de_conexion(e):
+            return {"estado": "error", "codigo": "sin_conexion", "motivo": MOTIVO_CONEXION}
+        return {"estado": "error", "codigo": "excepcion", "motivo": _corto(e)}
+    finally:
+        if con is not None:
+            try:
+                con.close()
+            except Exception:
+                pass
+
+
+# ------------------------------------------------------------------ comandos
+
+def comprobar_estructura(cfg: dict[str, str], base: str | None = None) -> dict:
+    """Prueba de la instalación, solo lectura: estructura y lecturas de referencia con una propuesta vacía."""
+    con = conectar_garro(cfg, solo_lectura=True, base=base)
+    try:
+        cur = con.cursor()
+        largos = verificar_estructura(cur)
+        ref = leer_referencias(cur, {}, datetime.now(), cfg, largos)
+        con.rollback()
+    finally:
+        con.close()
+    return {"estructura": "OK", "usuario_del_bot": ref.operario_id is not None,
+            "configuracion_contable": ref.cuenta_proveedores is not None and ref.cuenta_credito_fiscal is not None,
+            "cuentas": len(ref.cuentas), "categorias": len(ref.categorias), "regimenes": len(ref.regimenes)}
+
+
+def _cargar_archivo(ruta: str) -> dict:
+    with open(ruta, encoding="utf-8") as f:
+        datos = json.load(f)
+    if not isinstance(datos, dict):
+        raise ValueError("El archivo tiene que ser un objeto JSON.")
+    payload = datos["payload"] if isinstance(datos.get("payload"), dict) else datos
+    # Id propio en el diario (para poder deshacerla): las cargas a mano en una copia no tienen número de cola.
+    return {"id": f"copia-{int(time.time())}", "clave": str(datos.get("clave") or "archivo"), "modo": "en_seco",
+            "retomada": False, "payload": payload}
+
+
+def _id_de_carga(texto: str):
+    return int(texto) if texto.isdigit() else texto
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description="Carga de compras en Gestión Integral (apagada por defecto)")
+    grupo = ap.add_mutually_exclusive_group(required=True)
+    grupo.add_argument("--pasada", action="store_true", help="procesa la cola de cargas (lo que hace la tarea)")
+    grupo.add_argument("--archivo", metavar="CARGA.JSON", help="planifica esa carga contra Garro en solo lectura")
+    grupo.add_argument("--deshacer", metavar="N", help="borra lo que escribió la carga N (en una copia: el id que mostró al escribir)")
+    grupo.add_argument("--estructura", action="store_true", help="prueba la instalación (solo lectura)")
+    ap.add_argument("--escribir", action="store_true", help="con --archivo: la escribe, solo en una copia (--base)")
+    ap.add_argument("--confirmar", action="store_true", help="con --deshacer: borra de verdad")
+    ap.add_argument("--base", help="otra base (una copia) en lugar de GARRO_BASE")
+    ap.add_argument("--config", default=os.path.join(AQUI, g.ARCHIVO_CONFIG))
+    args = ap.parse_args(argv)
+    if args.escribir and not args.archivo:
+        ap.error("--escribir va con --archivo")
+    if args.confirmar and args.deshacer is None:
+        ap.error("--confirmar va con --deshacer")
+    if args.pasada and args.base:
+        ap.error("--pasada no usa --base: la base real solo se escribe por la cola")
+    try:
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, OSError):
+        pass
+
+    try:
+        cfg = g.leer_archivo(args.config)
+        if args.pasada:
+            pasada(cfg)
+            return 0
+        if args.estructura:
+            print(json.dumps(comprobar_estructura(cfg, args.base), ensure_ascii=False, indent=2))
+            return 0
+        if args.deshacer is not None:
+            resultado = deshacer(cfg, _id_de_carga(args.deshacer), args.confirmar, args.base)
+            print(json.dumps(resultado, ensure_ascii=False, indent=2, default=str))
+            return 0 if resultado["estado"] in ("sin_confirmar", "deshecha") else 1
+        # --archivo
+        if args.escribir and (not args.base or args.base == cfg.get("GARRO_BASE")):
+            print("Rechazado: --escribir solo se permite con --base de una COPIA distinta de la base real "
+                  "(la base real se escribe únicamente por la cola).")
+            return 2
+        carga = _cargar_archivo(args.archivo)
+        resultado = cargar_una(cfg, carga, en_seco=not args.escribir, base=args.base)
+        if args.escribir:
+            resultado["carga_id"] = carga["id"]  # para deshacerla: --deshacer ID --base COPIA
+        print(json.dumps(resultado, ensure_ascii=False, indent=2, default=str))
+        return 0 if resultado["estado"] in ("simulada", "cargada") else 1
+    except Exception as e:
+        g.escribir_traza()
+        print(f"ERROR: {g.traducir_error(e, 'origen')}")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

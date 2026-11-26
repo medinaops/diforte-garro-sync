@@ -101,6 +101,48 @@ Nadie tiene que sacar fotos a mano: la tarea de cada 5 minutos (`--si-hay-pedido
 - Cualquier error del relevamiento queda en `garro_sync.log` y nunca cambia el resultado de la tarea ni de la copia.
 - Para apagarlo: `RELEVAMIENTO_AUTO=0` en `.env.garro-sync`. Para probarlo a mano: `.\python\python.exe relevar_compras.py auto`.
 
+## Carga de compras (apagada por defecto)
+
+`garro_escritor.py` puede cargar en Gestión Integral los comprobantes de compra que alguien aprobó en Supabase, escribiendo las mismas filas que escribe el programa al cargarlos a mano. Es la única parte de garro-sync que escribe en Gestión Integral, y **no hace nada** hasta que estén las tres llaves:
+
+1. `CARGAS=1` en `.env.garro-sync` (sin esto la tarea ni mira la cola).
+2. `CARGAS_REAL=1` en `.env.garro-sync` (sin esto las cargas «reales» se procesan en seco: se calcula lo que se escribiría y se informa, sin tocar nada).
+3. El interruptor del lado de Supabase, que decide si una carga se aprueba como real.
+
+Otras claves: `CARGAS_POR_PASADA` (cuántas cargas procesa cada pasada de 5 minutos; por defecto 1, tope 5) y `CARGAS_OPERARIO` (usuario propio del bot en el programa; por defecto `botcompras`). La conexión usa las mismas credenciales `GARRO_*`: el usuario tiene que poder escribir en las tablas de compras.
+
+Cada comprobante va en una sola transacción con las tablas de compras, asientos y pagos bloqueadas: si algo no cierra, no queda nada. Antes de escribir se comprueba que las tablas tengan exactamente las columnas y tipos esperados y ningún trigger ni regla; si una actualización del programa los cambia, frena. Después de escribir, y antes de confirmar, se relee todo y se comprueba (en centavos) que el total y el asiento coincidan con lo planificado. Lo que no está confirmado contra cargas reales (otros tipos de comprobante, IVA distinto de 21 %, medios de pago poco usados, etc.) se rechaza y queda para cargar a mano. Si Gestión Integral está ocupada o no responde, la carga vuelve a la cola y se reintenta. Si una carga se cortó sin saberse si llegó a escribirse, primero se busca en el programa lo que el bot ya cargó: si está, se da por cargada; si no se puede comprobar, no se hace nada hasta que lo revise una persona.
+
+Cada escritura deja una línea en `cargas-diario.jsonl` (solo clave, total, base e ids; nunca el contenido del comprobante) y guarda una huella del contenido escrito: `--deshacer` solo borra si todo sigue exactamente como se escribió y no hay nada más colgado del comprobante; si alguien lo tocó en el programa, hay que anularlo desde el programa.
+
+```powershell
+python garro_escritor.py --estructura                  # prueba la instalación: estructura y lecturas (solo lectura)
+python garro_escritor.py --archivo carga.json          # planifica una carga contra Gestión Integral, sin escribir
+python garro_escritor.py --archivo carga.json --escribir --base COPIA   # la escribe en una COPIA de la base (nunca en la real); muestra su id «copia-...»
+python garro_escritor.py --deshacer N                  # carga de la cola: muestra qué borraría (solo lectura; la cola tiene que responder y decir «cargada»)
+python garro_escritor.py --deshacer N --confirmar      # la borra y la marca «deshecha» en la cola
+python garro_escritor.py --deshacer copia-... --base COPIA [--confirmar]   # una carga hecha a mano en una copia (no toca la cola)
+python garro_escritor.py --pasada                      # lo que hace la tarea de cada 5 minutos
+```
+
+La base real solo se escribe por la cola: `--archivo --escribir` se rechaza si no se indica otra base con `--base`.
+
+### Copia de prueba de la base
+
+Para probar la carga sin tocar la base real, `garro_copia.py` hace una copia en el mismo servidor. Se corre a mano, en el servidor donde está la base; de la base real solo lee, y el programa se puede seguir usando mientras tanto.
+
+```powershell
+python garro_copia.py --medir                  # solo lectura: cuánto ocupa la base, cuánto disco hay y si se puede copiar
+python garro_copia.py --crear gestion_prueba   # crea la copia (el nombre termina en _prueba)
+python garro_copia.py --borrar gestion_prueba  # borra una copia creada con este programa
+```
+
+- Usa `pg_dump` y `pg_restore` del propio servidor (los busca al lado de la carpeta de datos; si están en otro lado, indicar la carpeta en `GARRO_PG_BIN`). Tienen que ser de la misma versión que el servidor, y el usuario configurado tiene que ser superusuario: `--medir` lo comprueba y avisa.
+- Antes de copiar exige el doble del tamaño de la base más 500 MB libres en el disco, y corta si durante la copia el disco baja de 1 GB. La copia ocupa lo mismo que la base hasta que se borra.
+- Conviene hacerla en un horario de poca actividad: se lee la base entera una vez y se escribe otra igual. El programa se puede seguir usando, pero si en ese rato necesita reorganizar una tabla, esa operación espera a que termine la lectura.
+- Si falla o se corta a mitad, borra lo que alcanzó a crear; si no puede, lo dice en pantalla con el comando para borrarlo.
+- `--borrar` solo borra bases que este programa creó (les deja una marca) y nunca la configurada en `GARRO_BASE`. Si la ventana se cerró justo al empezar, la base puede haber quedado sin la marca: en ese caso se borra a mano.
+
 ## Guardia
 
 Antes de vaciar el espejo se valida lo leído. Si algo no cierra, **no se publica nada y sigue la copia anterior**; el motivo queda registrado y se ve en el sistema.
