@@ -4,6 +4,7 @@ Correr desde esta carpeta:  python -m pytest -q   (o:  python -m unittest -v tes
 """
 
 import copy
+import json
 import unittest
 from datetime import date, datetime
 
@@ -368,6 +369,84 @@ class ProveedoresDe(unittest.TestCase):
     def test_sin_cuit_ni_nombre(self):
         self.assertEqual(gc.proveedores_de({}, self.TODOS), [])
         self.assertEqual(gc.proveedores_de({"proveedor": "  "}, self.TODOS), [])
+
+
+class ProveedorFijadoEnLaAprobacion(unittest.TestCase):
+    """`proveedor_garro` (lo decidió la aprobación): el escritor usa ESE id y lo relee de Garro."""
+
+    def prov(self, cuit="30555123481", activo=True, id=468):
+        return {"id": id, "cuit": cuit, "razon_social": "TAPI HOUSE", "fantasia": None, "activo": activo}
+
+    def ref(self, *proveedores, **cambios):
+        return ref_base(proveedores=list(proveedores), **cambios)
+
+    def fijada(self, base=None, pid=468, **p):
+        c = base if base is not None else carga_base()
+        c["propuesta"]["proveedor_garro"] = {"id": pid, "razon_social": "TAPI HOUSE", "por": "nombre"}
+        c["propuesta"].update(p)
+        return c
+
+    def rechaza(self, codigo, carga, ref):
+        with self.assertRaises(gc.NoCargable) as cm:
+            gc.planificar(carga, ref, AHORA)
+        self.assertEqual(cm.exception.codigo, codigo)
+
+    def test_proveedores_de_usa_solo_el_id(self):
+        todos = [self.prov(), self.prov(id=9, cuit="30555123481")]
+        p = {"cuit": "30555123481", "proveedor": "OTRO", "proveedor_garro": {"id": 468}}
+        self.assertEqual([x["id"] for x in gc.proveedores_de(p, todos)], [468])
+        self.assertEqual(gc.proveedores_de({"proveedor_garro": {"id": 77}}, todos), [])
+
+    def test_proveedores_de_con_campo_invalido_no_cae_en_el_cuit(self):
+        todos = [self.prov()]
+        for pg in (None, {}, {"id": None}, {"id": "468"}, {"id": 468.5}, {"id": -1}, {"id": 0}, {"id": True}, 468, "468", []):
+            self.assertEqual(gc.proveedores_de({"cuit": "30555123481", "proveedor_garro": pg}, todos), [], repr(pg))
+
+    def test_factura_a_con_el_mismo_cuit_carga_al_id_fijado(self):
+        plan = gc.planificar(self.fijada(cuit="30-55512348-1"), self.ref(self.prov()), AHORA)
+        self.assertEqual(plan.comprobante["fk_id_proveedor"], 468)
+
+    def test_factura_a_con_cuit_distinto_o_vacio_en_garro_no_se_carga(self):
+        for cuit_garro in ("30711982538", "", None, "30-5551234"):
+            self.rechaza("proveedor_cuit", self.fijada(), self.ref(self.prov(cuit=cuit_garro)))
+
+    def test_factura_a_sin_cuit_valido_en_el_papel_no_se_carga(self):
+        for cuit in (None, "", "30-5551234-8"):
+            self.rechaza("cuit", self.fijada(cuit=cuit), self.ref(self.prov()))
+
+    def test_remito_x_alcanza_con_el_id_aunque_garro_no_tenga_cuit_o_el_papel_traiga_otro(self):
+        for cuit_garro in ("", None, "20999999999"):
+            for cuit_papel in (None, "", "20-11111111-2", "123"):
+                c = self.fijada(remito_x(cuit=cuit_papel, proveedor="TAPI HOUSE SRL"))
+                plan = gc.planificar(c, self.ref(self.prov(cuit=cuit_garro), **REF_X), AHORA)
+                self.assertEqual(plan.comprobante["fk_id_proveedor"], 468)
+
+    def test_id_que_no_existe_o_inactivo(self):
+        c = self.fijada(remito_x(), pid=999)      # lo que lee el escritor: solo el id fijado, y ese no está
+        self.rechaza("proveedor", c, self.ref(*gc.proveedores_de(c["propuesta"], [self.prov()]), **REF_X))
+        self.rechaza("proveedor", self.fijada(remito_x()), self.ref(**REF_X))
+        self.rechaza("proveedor_inactivo", self.fijada(remito_x()), self.ref(self.prov(activo=False), **REF_X))
+        self.rechaza("proveedor_inactivo", self.fijada(cuit="30-55512348-1"), self.ref(self.prov(activo=False)))
+
+    def test_id_no_entero_negativo_o_proveedor_sin_resolver_no_se_carga(self):
+        for pg in (None, {}, {"id": None}, {"id": "468"}, {"id": 1.5}, {"id": -468}, {"id": 0}, {"id": False}, "468"):
+            c = remito_x()
+            c["propuesta"]["proveedor_garro"] = pg
+            self.rechaza("proveedor_sin_resolver", c, self.ref(self.prov(), **REF_X))
+
+    def test_sin_el_campo_sigue_como_antes(self):
+        plan = gc.planificar(carga_base(), ref_base(), AHORA)
+        self.assertEqual(plan.comprobante["fk_id_proveedor"], 5)
+        self.rechaza("proveedor", remito_x(cuit=None, proveedor=None), ref_base(**REF_X))
+
+    def test_requiere_revision_sigue_mandando(self):
+        self.rechaza("requiere_revision", self.fijada(requiere_revision=True, cuit="30-55512348-1"), self.ref(self.prov()))
+
+    def test_no_modifica_la_propuesta(self):
+        c = self.fijada(cuit="30-55512348-1")
+        antes = json.dumps(c, sort_keys=True)
+        gc.planificar(c, self.ref(self.prov()), AHORA)
+        self.assertEqual(json.dumps(c, sort_keys=True), antes)
 
 
 class LimpiarTexto(unittest.TestCase):

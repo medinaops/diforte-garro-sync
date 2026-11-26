@@ -257,9 +257,20 @@ def nombre_clave(texto) -> str:
     return re.sub(r"[^A-Z0-9]+", " ", t).strip()
 
 
+def proveedor_garro_id(propuesta: dict) -> int | None:
+    """Id de Garro que la aprobación fijó (`proveedor_garro.id`), o None si falta o no es un entero positivo."""
+    pg = propuesta.get("proveedor_garro")
+    pid = _entero(pg.get("id")) if isinstance(pg, dict) else None
+    return pid if pid is not None and pid > 0 else None
+
+
 def proveedores_de(propuesta: dict, todos: list[dict]) -> list[dict]:
     """Los proveedores del programa que corresponden al comprobante. `todos`: {id, cuit, razon_social,
-    fantasia, activo}. Con CUIT manda el CUIT; sin CUIT, el nombre exacto (razón social o fantasía)."""
+    fantasia, activo}. Si la propuesta trae `proveedor_garro` (lo decidió la aprobación), manda ese id; si no,
+    con CUIT manda el CUIT y sin CUIT el nombre exacto (razón social o fantasía)."""
+    if "proveedor_garro" in propuesta:
+        pid = proveedor_garro_id(propuesta)
+        return [p for p in todos if p.get("id") == pid] if pid is not None else []
     cuit = solo_digitos(propuesta.get("cuit"))
     if cuit:
         return [p for p in todos if solo_digitos(p.get("cuit")) == cuit]
@@ -453,21 +464,36 @@ def planificar(carga: dict, ref: Referencias, ahora: datetime) -> Plan:
     if ref.operario_id is None:
         raise NoCargable("sin_operario", "No está el usuario del bot en el programa.")
 
-    # El proveedor lo busca el escritor: por CUIT si el comprobante lo trae; si no (los presupuestos
-    # no fiscales no lo traen), por razón social o nombre de fantasía exactos. Tiene que haber uno solo.
+    # Con `proveedor_garro` el proveedor ya lo decidió la aprobación (y lo vio la persona): se usa ese id. Sin el
+    # campo (cargas encoladas antes) lo busca el escritor: por CUIT si el comprobante lo trae; si no (los
+    # presupuestos no fiscales no lo traen), por razón social o nombre de fantasía exactos. Tiene que haber uno solo.
     cuit = solo_digitos(p.get("cuit"))
-    if not cuit and tipo_id == TIPO_FACTURA_A:
-        raise NoCargable("cuit", "Una Factura A tiene que traer el CUIT del proveedor.")
-    if cuit and len(cuit) != 11:
-        raise NoCargable("cuit", "El CUIT del proveedor no tiene 11 dígitos.")
-    if not cuit and not nombre_clave(p.get("proveedor")):
-        raise NoCargable("proveedor", "El comprobante no trae ni el CUIT ni el nombre del proveedor.")
-    if len(ref.proveedores) != 1:
-        raise NoCargable("proveedor", f"No hay un único proveedor con ese {'CUIT' if cuit else 'nombre'} "
-                                      f"en el programa (encontrados: {len(ref.proveedores)}).")
+    fijado = "proveedor_garro" in p
+    if fijado:
+        pid = proveedor_garro_id(p)
+        if pid is None:
+            raise NoCargable("proveedor_sin_resolver",
+                             "En la aprobación no se resolvió a qué proveedor de Garro cargarlo: se carga a mano.")
+        if tipo_id == TIPO_FACTURA_A and len(cuit) != 11:
+            raise NoCargable("cuit", "Una Factura A tiene que traer el CUIT del proveedor (11 dígitos).")
+        if len(ref.proveedores) != 1:
+            raise NoCargable("proveedor", f"El proveedor de Garro elegido en la aprobación (id {pid}) no existe en el programa.")
+    else:
+        if not cuit and tipo_id == TIPO_FACTURA_A:
+            raise NoCargable("cuit", "Una Factura A tiene que traer el CUIT del proveedor.")
+        if cuit and len(cuit) != 11:
+            raise NoCargable("cuit", "El CUIT del proveedor no tiene 11 dígitos.")
+        if not cuit and not nombre_clave(p.get("proveedor")):
+            raise NoCargable("proveedor", "El comprobante no trae ni el CUIT ni el nombre del proveedor.")
+        if len(ref.proveedores) != 1:
+            raise NoCargable("proveedor", f"No hay un único proveedor con ese {'CUIT' if cuit else 'nombre'} "
+                                          f"en el programa (encontrados: {len(ref.proveedores)}).")
     proveedor = ref.proveedores[0]
     if not proveedor.get("activo"):
         raise NoCargable("proveedor_inactivo", "El proveedor está inactivo en el programa.")
+    if fijado and tipo_id == TIPO_FACTURA_A and solo_digitos(proveedor.get("cuit")) != cuit:
+        raise NoCargable("proveedor_cuit", "El CUIT de la Factura A no es el que tiene ese proveedor en el programa: "
+                                           "corregilo en Garro y cargala a mano.")
 
     punto_venta, numero = _entero(p.get("punto_venta")), _entero(p.get("numero"))
     if punto_venta is None or not 0 < punto_venta <= 99999 or numero is None or not 0 < numero <= 99999999:
