@@ -131,6 +131,7 @@ DIAS_VENCIMIENTO = 30
 TIPO_FACTURA_A = 1
 TIPO_REMITO_X = 5
 TIPOS_HABILITADOS = (TIPO_FACTURA_A, TIPO_REMITO_X)
+NUMERAR_SIGUIENTE = "siguiente"
 IVA_POR_TIPO = {TIPO_FACTURA_A: 21.0, TIPO_REMITO_X: 0.0}
 TIPO_REGIMEN_PERCEPCION = 2
 
@@ -171,6 +172,8 @@ class Referencias:
     duplicados: list[int]                   # comprobantes activos del mismo proveedor, tipo y número
     siguiente_grupo: int | None             # próximo número de asiento del mes de la fecha
     pagos_a_cuenta: list[dict] = field(default_factory=list)   # {id, fecha, resto}, del proveedor
+    remitos_del_dia: list[dict] = field(default_factory=list)  # solo con numerar: Remitos X activos del proveedor de esa fecha {id, punto_venta, numero, centavos}
+    numeracion: dict | None = None          # solo con propuesta.numerar: {punto_venta, numero} asignados (Remito X sin número en el papel)
     largos: dict[str, int | None] = field(default_factory=dict)  # «tabla.columna» -> largo máximo
 
 
@@ -186,9 +189,11 @@ class Plan:
     percepciones: float
     total: float
     avisos: list[str]
+    numeracion: dict | None = None  # {punto_venta, numero} cuando el número lo asignó el programa (propuesta.numerar)
 
     def resumen(self) -> dict:
         return {
+            **({"numeracion": dict(self.numeracion)} if self.numeracion else {}),
             "receta": VERSION_RECETA,
             "renglones": len(self.items),
             "neto": r2(self.neto), "iva": r2(self.iva), "percepciones": r2(self.percepciones),
@@ -457,6 +462,18 @@ def planificar(carga: dict, ref: Referencias, ahora: datetime) -> Plan:
     tipo_id = _entero(p.get("tipo_garro_id"))
     if tipo_id not in TIPOS_HABILITADOS or p.get("es_nota_credito"):
         raise NoCargable("tipo_no_habilitado", "Por ahora solo se cargan Factura A y Remito X.")
+    numerar = p.get("numerar")
+    if numerar is not None:
+        # Contrato de la cola: «numerar»: «siguiente» solo en un Remito X, sin número, con punto de venta vacío o entero.
+        if tipo_id != TIPO_REMITO_X:
+            raise NoCargable("numerar_tipo", "La numeración automática solo vale para un Remito X.")
+        if numerar != NUMERAR_SIGUIENTE:
+            raise NoCargable("numerar", "El valor de «numerar» no es válido (solo «siguiente»).")
+        if p.get("numero") is not None:
+            raise NoCargable("numerar", "Un comprobante para numerar no puede traer número.")
+        pv = p.get("punto_venta")
+        if pv is not None and (_entero(pv) is None or not 0 < _entero(pv) <= 99999):
+            raise NoCargable("numerar", "El punto de venta no es válido.")
     if ref.tipo is None or ref.tipo.get("id") != tipo_id:
         raise NoCargable("tipo_desconocido", "El tipo de comprobante no existe en el programa.")
     if p.get("requiere_revision") is not False:
@@ -495,7 +512,12 @@ def planificar(carga: dict, ref: Referencias, ahora: datetime) -> Plan:
         raise NoCargable("proveedor_cuit", "El CUIT de la Factura A no es el que tiene ese proveedor en el programa: "
                                            "corregilo en Garro y cargala a mano.")
 
-    punto_venta, numero = _entero(p.get("punto_venta")), _entero(p.get("numero"))
+    if numerar is not None:
+        if not isinstance(ref.numeracion, dict):
+            raise NoCargable("numerar", "No se pudo calcular el número del Remito X.")
+        punto_venta, numero = ref.numeracion["punto_venta"], ref.numeracion["numero"]
+    else:
+        punto_venta, numero = _entero(p.get("punto_venta")), _entero(p.get("numero"))
     if punto_venta is None or not 0 < punto_venta <= 99999 or numero is None or not 0 < numero <= 99999999:
         raise NoCargable("numero", "El punto de venta o el número del comprobante no son válidos.")
     if ref.duplicados:
@@ -603,4 +625,15 @@ def planificar(carga: dict, ref: Referencias, ahora: datetime) -> Plan:
         if abs(r2(total_impreso - r2(plan.total))) > 0.011:
             raise NoCargable("total_no_cierra", "Ni con el renglón de redondeo se llega al total impreso.")
     plan.avisos = avisos
+    if numerar is not None:
+        # El número es nuevo por construcción: «ya_cargado» nunca dispara. Si el proveedor ya tiene ese día un Remito X por
+        # el mismo total (en centavos), lo más probable es que sea el mismo papel cargado antes con otro número.
+        centavos = round(plan.total * 100)
+        for existente in ref.remitos_del_dia:
+            if abs(int(existente["centavos"]) - centavos) <= 1:
+                raise NoCargable("posible_duplicado",
+                                 f"El proveedor ya tiene un Remito X de esa fecha por el mismo total (comprobante {existente['id']}, "
+                                 f"número {numero_lindo(int(existente['punto_venta']), int(existente['numero']))}): puede ser el mismo papel. "
+                                 "Se carga a mano si no lo es.")
+        plan.numeracion = {"punto_venta": punto_venta, "numero": numero, "numero_lindo": numero_lindo(punto_venta, numero)}
     return plan

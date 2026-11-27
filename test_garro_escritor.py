@@ -390,6 +390,61 @@ class Excepciones(Base):
         self.assertEqual(ge._incierta({"estado": "rechazada"}, True)["estado"], "rechazada")
 
 
+class RetomadaNumerada(Base):
+    """Retomada de un Remito X con numerar: la propuesta no trae número, así que se busca por otros datos."""
+
+    def carga(self):
+        c = carga_base()
+        c["propuesta"].update(tipo_garro_id=5, numero=None, punto_venta=None, numerar="siguiente")
+        return {"id": 31, "clave": "k", "modo": "real", "retomada": True, "payload": c}
+
+    def cargar(self, resultado):
+        with mock.patch.object(ge, "_buscar_lo_propio_numerado", return_value=resultado) as buscar, \
+                mock.patch.object(ge, "_buscar_lo_propio") as comun, mock.patch.object(ge, "conectar_garro", side_effect=RuntimeError("no llega")):
+            r = ge.cargar_una({"GARRO_BASE": "b"}, self.carga(), en_seco=False)
+        buscar.assert_called_once()
+        comun.assert_not_called()  # la búsqueda por número no sirve: el número no está en la propuesta
+        return r
+
+    def test_un_unico_resultado_es_ya_cargada_con_su_punto_de_venta_y_numero(self):
+        r = self.cargar((77, True, {"punto_venta": 3, "numero": 78}))
+        self.assertEqual((r["estado"], r["comprobante_id"], r["recuperada"], r["punto_venta"], r["numero"]), ("cargada", 77, True, 3, 78))
+
+    def test_mas_de_uno_va_a_revisar_con_un_motivo_claro(self):
+        r = self.cargar((None, True, {"problema": "varios", "motivo": "hay más de un comprobante del bot (ids 1, 2)"}))
+        self.assertEqual((r["estado"], r["codigo"]), ("revisar", "varios_propios"))
+        self.assertIn("ids 1, 2", r["motivo"])
+
+    def test_la_huella_que_no_coincide_va_a_revisar(self):
+        r = self.cargar((77, True, {"problema": "huella", "motivo": "alguien lo modificó"}))
+        self.assertEqual((r["estado"], r["codigo"], r["comprobante_id"]), ("revisar", "huella_distinta", 77))
+
+    def test_ninguno_conclusivo_sigue_como_una_carga_sin_numerar_y_no_concluyente_es_indeterminada(self):
+        r = self.cargar((None, True, {}))
+        # siguió al planificador (la conexión falsa falla: en una retomada eso es «indeterminado», pero no por la búsqueda)
+        self.assertEqual(r["estado"], "indeterminado")
+        self.assertNotEqual(r.get("codigo"), "busqueda_inconclusa")
+        r = self.cargar((None, False, {}))
+        self.assertEqual((r["estado"], r["codigo"]), ("indeterminado", "busqueda_inconclusa"))
+
+    def test_si_el_diario_dice_que_se_escribio_y_ya_no_esta_no_se_reescribe(self):
+        ge.diario_escribir("cargada", {"id": 31, "clave": "k"}, "b", escrito={"comprobantes_compras": [77], "numeracion": {"punto_venta": 3, "numero": 78}})
+        r = self.cargar((None, True, {}))
+        self.assertEqual((r["estado"], r["codigo"]), ("indeterminado", "escrita_y_ya_no_esta"))
+
+    def test_una_busqueda_que_falla_es_indeterminada(self):
+        with mock.patch.object(ge, "_buscar_lo_propio_numerado", side_effect=RuntimeError("sin red")):
+            r = ge.cargar_una({"GARRO_BASE": "b"}, self.carga(), en_seco=False)
+        self.assertEqual((r["estado"], r["codigo"]), ("indeterminado", "busqueda_fallida"))
+
+    def test_sin_numero_ni_fecha_o_total_no_se_puede_buscar(self):
+        c = self.carga()
+        c["payload"].pop("total_pesos")
+        with mock.patch.object(ge, "conectar_garro") as conectar:
+            self.assertEqual(ge._buscar_lo_propio_numerado({"GARRO_BASE": "b"}, c, c["payload"]["propuesta"], None, "b"), (None, False, {}))
+        conectar.assert_not_called()
+
+
 class RetomadaSinBase(Base):
     CARGA = {"id": 8, "clave": "k", "modo": "real", "retomada": True, "payload": carga_base()}
 

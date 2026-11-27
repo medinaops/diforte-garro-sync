@@ -93,6 +93,7 @@ Lo normal es verlo resuelto en menos de 5 minutos. Un pendiente que no se tomó 
 |---|---|---|
 | `version` | `--version` de `garro_sync.py` y `garro_escritor.py` | ninguno |
 | `estructura` | `garro_escritor.py --estructura` (solo lectura) | ninguno |
+| `indices` | `garro_indices.py`: índices (con `pg_get_indexdef`, marcando los únicos), restricciones (`pg_get_constraintdef`: PK, UNIQUE, CHECK, FK), triggers y reglas de las tablas que toca el escritor, de la base real, en una sesión de solo lectura (PostgreSQL 9.3: solo catálogos; nada de filas). Primero un resumen de lo que impide duplicados y después el detalle. Hace falta la migración 695 | ninguno |
 | `perfil` | `comparar_movimientos.py --perfil` (solo lectura) | ninguno |
 | `copia_medir` | `garro_copia.py --medir` (solo lectura) | ninguno |
 | `copia_crear` | `garro_copia.py --crear` | `base` |
@@ -201,6 +202,17 @@ Contrato de la cola para un movimiento: `payload.propuesta` con `clase`, `tipo_m
 **Antes de habilitar movimientos reales** (`tipos_mov_reales` en la cola) es obligatorio, en la copia de prueba: `python comparar_movimientos.py --perfil` y `python comparar_movimientos.py --base COPIA --humano <id de una persona> --bot <id del bot>` para un efectivo y para una transferencia. Dos columnas del movimiento bancario (`obs` y `nro`) no están confirmadas: el relevamiento las redacta, y el bot escribe cadena vacía.
 
 **Permisos del usuario de la conexión** (`GARRO_USUARIO`): además de lo de compras, INSERT, UPDATE y DELETE sobre `movimientos_fondos`, `efectivo_medio_de_pago`, `efectivo_medio_de_pago_en_movimientos_fondos`, `movimientos_cuentas_bancarias` y `movimientos_cuenta_bancaria_en_movimientos_fondos`; SELECT sobre `movimientos_fondos_tipos`, `cajas`, `cuentas_bancarias`, `otro_medio_de_pago` y `otro_medio_de_pago_en_movimientos_fondos`; y LOCK TABLE sobre `movimientos_fondos` (en PostgreSQL requiere UPDATE, DELETE o TRUNCATE sobre la tabla). `--deshacer` toma las cinco filas con `SELECT … FOR UPDATE`, que en PostgreSQL requiere UPDATE sobre esas tablas (no las modifica).
+
+### Numeración automática del Remito X (desde la v1.10.1)
+
+Cuando el papel no trae número, la propuesta de un Remito X puede venir con `"numerar": "siguiente"`, `"numero": null` y `"punto_venta"` null o un entero. Sin `numerar` todo sigue igual: número y punto de venta obligatorios, del papel. Con cualquier otro tipo, `numerar` se rechaza (`numerar_tipo`), y también un valor distinto de `siguiente` o un `numero` que no sea null.
+
+- **Punto de venta:** el de la propuesta; si no viene, el del ÚLTIMO Remito X activo del proveedor (el `id_comprobante_compra` más alto); si no tiene ninguno, 1.
+- **Número:** el del último Remito X activo del proveedor con ese punto de venta (por id, no el máximo) + 1, o 1 si no hay; si el proveedor ya tiene un comprobante activo con ese número (de cualquier tipo y punto de venta: el mismo criterio de choque que el chequeo de duplicados), sigue sumando hasta uno libre. Los anulados no cuentan.
+- Se calcula **dentro de la transacción de escritura, con las tablas ya bloqueadas**: una carga a mano simultánea no puede chocar (si el programa tiene una carga en curso, la del bot vuelve a la cola sin escribir).
+- En seco, el plan trae `numeracion` (`punto_venta`, `numero`, `numero_lindo`) con la nota «a confirmar al cargar». Una carga real devuelve `punto_venta` y `numero` asignados (y los guarda en `escrito.numeracion` del diario); la huella de `--deshacer` cubre las filas con el número realmente escrito.
+- **Posible duplicado:** el número es nuevo por construcción, así que «ya cargado» no dispara. Con la tabla ya bloqueada se busca un Remito X activo del mismo proveedor, de la misma fecha y del mismo total (en centavos, tolerancia de 1): si existe, `NoCargable("posible_duplicado")` con el id y el número del existente (también en seco).
+- **Retomada** de una carga numerada que se cortó sin saber si se escribió: primero el número que el diario local alcanzó a anotar (`cargada` o `intento`: proveedor + número + usuario del bot); si no, proveedor + Remito X + usuario del bot + fecha + total. Un único resultado es «ya cargada» (si el diario guardó la huella, tiene que coincidir; si no, `revisar` / `huella_distinta`); ninguno, se vuelve a cargar como una carga nueva; más de uno, `revisar` / `varios_propios` con el motivo.
 
 Si la cola todavía no tiene `cargas_tomar(text[])`, la pasada vuelve a `cargas_tomar()` y las compras siguen funcionando.
 

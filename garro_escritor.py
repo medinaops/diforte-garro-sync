@@ -281,6 +281,14 @@ def leer_referencias(cur, propuesta, ahora: datetime, cfg: dict[str, str], largo
     duplicados: list[int] = []
     numero = gc._entero(p.get("numero"))
     unico = proveedores[0] if len(proveedores) == 1 else None
+    numeracion, remitos_dia = None, []
+    if unico is not None and p.get("numerar") == gc.NUMERAR_SIGUIENTE and tipo_id == gc.TIPO_REMITO_X and numero is None:
+        # Dentro de la transacción y con las tablas ya bloqueadas: una carga a mano simultánea no puede chocar.
+        numeracion = siguiente_numero_remito(cur, unico["id"], gc._entero(p.get("punto_venta")))
+        numero = numeracion["numero"]
+        fecha_numerada = _fecha_de(p)
+        if fecha_numerada is not None:
+            remitos_dia = remitos_del_dia(cur, unico["id"], fecha_numerada)
     if unico is not None and numero is not None:
         # De cualquier tipo y punto de venta: es a propósito conservador (el equipo a veces carga con otro punto).
         cur.execute("""SELECT id_comprobante_compra FROM comprobantes_compras
@@ -324,7 +332,64 @@ def leer_referencias(cur, propuesta, ahora: datetime, cfg: dict[str, str], largo
     return gc.Referencias(
         proveedores=proveedores, tipo=tipo, operario_id=operario_id, cuenta_proveedores=cuenta_proveedores,
         cuenta_credito_fiscal=cuenta_credito, cuentas=cuentas, categorias=categorias, regimenes=regimenes,
-        duplicados=duplicados, siguiente_grupo=siguiente_grupo, pagos_a_cuenta=pagos_a_cuenta, largos=dict(largos))
+        duplicados=duplicados, siguiente_grupo=siguiente_grupo, pagos_a_cuenta=pagos_a_cuenta, numeracion=numeracion,
+        remitos_del_dia=remitos_dia, largos=dict(largos))
+
+
+# Total de un comprobante en centavos, releído de sus renglones y percepciones (la misma cuenta que verificar_escrito).
+# `c` es la tabla de comprobantes.
+_TOTAL_DEL_COMPROBANTE_CENTAVOS = """round((
+      coalesce((SELECT sum(i.can_item_comprobante_compra::numeric * i.imp_neto_item_comprobante_compra::numeric
+                           * (1 + i.porc_desc_item_comprobante_compra::numeric / 100)
+                           * (1 + c.porc_desc_comprobante_compra::numeric / 100)
+                           * (1 + i.porc_iva_item_comprobante_compra::numeric / 100))
+                FROM items_comprobantes_compras AS i WHERE i.fk_id_comprobante_compra = c.id_comprobante_compra), 0)
+    + coalesce((SELECT sum(r.imp_regimen_especial_x_comprobante_compra::numeric)
+                FROM regimenes_especiales_x_comprobantes_compras AS r
+                WHERE r.fk_id_comprobante_compra = c.id_comprobante_compra), 0)) * 100)"""
+
+
+def remitos_del_dia(cur, proveedor_id: int, fecha: date, operario_id: int | None = None) -> list[dict]:
+    """Remitos X activos del proveedor de esa fecha, con su total en centavos (y, si se pide, solo los del usuario del bot)."""
+    filtro, params = ("", ())
+    if operario_id is not None:
+        filtro, params = " AND c.fk_id_operario = %s", (operario_id,)
+    cur.execute(f"""SELECT c.id_comprobante_compra, c.nro_suc_comprobante_compra, c.nro_comprobante_compra, {_TOTAL_DEL_COMPROBANTE_CENTAVOS}
+                    FROM comprobantes_compras AS c
+                    WHERE c.estado_comprobante_compra = 'activo' AND c.fk_id_proveedor = %s
+                      AND c.fk_id_tipo_comprobante_compra = %s AND c.fec_comprobante_compra::date = %s{filtro} ORDER BY 1""",
+                (proveedor_id, gc.TIPO_REMITO_X, fecha, *params))
+    return [{"id": r[0], "punto_venta": r[1], "numero": r[2], "centavos": int(r[3])} for r in cur.fetchall()]
+
+
+def siguiente_numero_remito(cur, proveedor_id: int, punto_venta: int | None) -> dict:
+    """Número que le toca a un Remito X del proveedor cuando el papel no lo trae (propuesta.numerar = «siguiente»).
+    Punto de venta: el pedido; si no, el del ÚLTIMO Remito X activo del proveedor (el id más alto); si no hay, 1.
+    Número: el del último Remito X activo del proveedor con ese punto de venta (por id, no el máximo) + 1, o 1; y si
+    el proveedor ya tiene un comprobante ACTIVO con ese número (de cualquier tipo y punto de venta: el mismo criterio de
+    choque del chequeo de duplicados) sigue sumando hasta uno libre."""
+    base = ("SELECT nro_suc_comprobante_compra, nro_comprobante_compra FROM comprobantes_compras "
+            "WHERE estado_comprobante_compra = 'activo' AND fk_id_proveedor = %s AND fk_id_tipo_comprobante_compra = %s")
+    if punto_venta is None:
+        cur.execute(base + " ORDER BY id_comprobante_compra DESC LIMIT 1", (proveedor_id, gc.TIPO_REMITO_X))
+        fila = cur.fetchone()
+        punto_venta = int(fila[0]) if fila and fila[0] else 1
+        ultimo = fila[1] if fila and fila[0] else None
+    else:
+        cur.execute(base + " AND nro_suc_comprobante_compra = %s ORDER BY id_comprobante_compra DESC LIMIT 1",
+                    (proveedor_id, gc.TIPO_REMITO_X, punto_venta))
+        fila = cur.fetchone()
+        ultimo = fila[1] if fila else None
+    numero = int(ultimo) + 1 if ultimo else 1
+    cur.execute("""SELECT DISTINCT nro_comprobante_compra FROM comprobantes_compras
+                   WHERE estado_comprobante_compra = 'activo' AND fk_id_proveedor = %s AND nro_comprobante_compra >= %s
+                   ORDER BY 1""", (proveedor_id, numero))
+    usados = {int(r[0]) for r in cur.fetchall() if r[0] is not None}
+    while numero in usados:
+        numero += 1
+    if not 0 < punto_venta <= 99999 or numero > 99999999:
+        raise gc.NoCargable("numerar", "No se pudo asignar un número válido al Remito X.")
+    return {"punto_venta": punto_venta, "numero": numero, "numero_lindo": gc.numero_lindo(punto_venta, numero)}
 
 
 # ------------------------------------------------------------------ escritura
@@ -717,6 +782,66 @@ def _buscar_lo_propio(cfg: dict[str, str], propuesta: dict, base: str | None) ->
         con.close()
 
 
+def _buscar_lo_propio_numerado(cfg: dict[str, str], carga: dict, propuesta: dict, base: str | None,
+                               nombre_base: str) -> tuple[int | None, bool, dict]:
+    """Retomada de un Remito X que pidió numeración automática (la propuesta no trae número). Devuelve
+    (id o None, conclusiva, extra): extra trae `problema` («varios» o «huella») y `motivo`, o el punto de venta y el número
+    del que se encontró.
+    Primero el número que el diario local alcanzó a anotar (evento «cargada» o «intento»): proveedor + número + usuario
+    del bot. Sin eso, proveedor + Remito X + usuario del bot + fecha + total (en centavos). Un único resultado es «ya
+    cargada» (si el diario guardó la huella, tiene que coincidir); ninguno, se puede volver a cargar; más de uno, a revisar."""
+    fecha = _fecha_de(propuesta)
+    total = gc._numero(carga.get("payload", {}).get("total_pesos") if isinstance(carga.get("payload"), dict) else None)
+    previo = diario_ultimo(carga.get("id"), ("cargada",), nombre_base)
+    anotado = previo or diario_ultimo(carga.get("id"), ("intento",), nombre_base) or {}
+    num = anotado.get("escrito", {}).get("numeracion") if isinstance(anotado.get("escrito"), dict) else anotado.get("numeracion")
+    num = num if isinstance(num, dict) and gc._entero(num.get("numero")) else None
+    if num is None and (fecha is None or total is None):
+        return None, False, {}
+    con = conectar_garro(cfg, solo_lectura=True, base=base)
+    try:
+        cur = con.cursor()
+        cur.execute("SELECT id_operario FROM operarios WHERE nombre_usuario = %s AND habilitado",
+                    (cfg.get("CARGAS_OPERARIO", OPERARIO_POR_DEFECTO),))
+        operarios = cur.fetchall()
+        cur.execute("SELECT id_proveedor, cuit_proveedor, raz_soc_proveedor, nom_fan_proveedor, es_activo FROM proveedores")
+        todos = [{"id": r[0], "cuit": r[1], "razon_social": r[2], "fantasia": r[3], "activo": r[4]} for r in cur.fetchall()]
+        proveedores = gc.proveedores_de(propuesta, todos)
+        if len(operarios) != 1 or len(proveedores) != 1:
+            return None, False, {}
+        prov, operario = proveedores[0]["id"], operarios[0][0]
+        if num is not None:
+            cur.execute("""SELECT id_comprobante_compra, nro_suc_comprobante_compra, nro_comprobante_compra FROM comprobantes_compras AS c
+                           WHERE estado_comprobante_compra = 'activo' AND fk_id_proveedor = %s AND fk_id_tipo_comprobante_compra = %s
+                             AND nro_comprobante_compra = %s AND fk_id_operario = %s ORDER BY 1""",
+                        (prov, gc.TIPO_REMITO_X, gc._entero(num["numero"]), operario))
+            encontrados = [{"id": r[0], "punto_venta": r[1], "numero": r[2]} for r in cur.fetchall()]
+        else:
+            encontrados = [{"id": r["id"], "punto_venta": r["punto_venta"], "numero": r["numero"]}
+                           for r in remitos_del_dia(cur, prov, fecha, operario) if abs(r["centavos"] - round(total * 100)) <= 1]
+        if len(encontrados) > 1:
+            ids = ", ".join(str(e["id"]) for e in encontrados)
+            return None, True, {"problema": "varios", "motivo": (
+                f"Esta carga (Remito X numerado automáticamente) se cortó sin saber si se escribió, y hay más de un comprobante del bot "
+                f"que podría ser el suyo (ids {ids}): lo revisa una persona.")}
+        if not encontrados:
+            return None, True, {}
+        e = encontrados[0]
+        escrito = previo.get("escrito") if previo else None
+        if isinstance(escrito, dict) and escrito.get("huella"):
+            try:
+                normal = _normalizar_escrito(escrito)
+                if huella(cur, normal) != normal["huella"]:
+                    return e["id"], True, {"problema": "huella", "motivo": (
+                        f"El comprobante {e['id']} es el de esta carga, pero alguien lo modificó en el programa después de cargarlo "
+                        "(la huella no coincide): lo revisa una persona.")}
+            except ErrorDeshacer:
+                return e["id"], True, {"problema": "huella", "motivo": "El diario local de esta carga no es válido: lo revisa una persona."}
+        return e["id"], True, {"punto_venta": e["punto_venta"], "numero": e["numero"]}
+    finally:
+        con.close()
+
+
 def _buscar_movimiento_propio(cfg: dict[str, str], propuesta: dict, base: str | None) -> tuple[int | None, bool]:
     """Para una retomada: ¿el bot ya escribió este movimiento? Mismo usuario del bot, mismo tipo, misma descripción
     exacta, misma fecha y el mismo importe en centavos (sumando sus medios). Solo lectura y sin LOCK. Devuelve
@@ -786,17 +911,25 @@ def cargar_una(cfg: dict[str, str], carga: dict, en_seco: bool, ahora: datetime 
     intento = diario_ultimo(carga.get("id"), ("intento",), nombre_base) if movimiento else True
     if retomada_real and intento:
         try:
-            existente, conclusiva = (_buscar_movimiento_propio if movimiento else _buscar_lo_propio)(cfg, propuesta, base)
+            if not movimiento and propuesta.get("numerar") is not None:
+                existente, conclusiva, extra_busqueda = _buscar_lo_propio_numerado(cfg, carga, propuesta, base, nombre_base)
+            else:
+                existente, conclusiva = (_buscar_movimiento_propio if movimiento else _buscar_lo_propio)(cfg, propuesta, base)
+                extra_busqueda = {}
         except Exception as e:
             g.escribir_traza()
             g.decir(f"{_ahora_txt()} (cargas) carga {carga.get('id')}: no se pudo buscar lo ya escrito: {_corto(e)}")
             return {"estado": "indeterminado", "codigo": "busqueda_fallida",
                     "motivo": "No se pudo comprobar si la carga ya estaba escrita; el detalle está en el log local."}
+        if extra_busqueda.get("problema"):
+            return {"estado": "revisar", "codigo": "varios_propios" if extra_busqueda["problema"] == "varios" else "huella_distinta",
+                    "motivo": extra_busqueda["motivo"], **({"comprobante_id": existente} if existente is not None else {})}
         if existente is not None:
             previo = diario_ultimo(carga.get("id"), ("cargada",), nombre_base)
             id_propio = {"clase": CLASE_MOVIMIENTO, "movimiento_id": existente} if movimiento else {"comprobante_id": existente}
             return {"estado": "cargada", **id_propio, "recuperada": True,
-                    "escrito": previo.get("escrito") if previo else None}
+                    "escrito": previo.get("escrito") if previo else None,
+                    **({k: extra_busqueda[k] for k in ("punto_venta", "numero") if k in extra_busqueda})}
         if not conclusiva:
             return {"estado": "indeterminado", "codigo": "busqueda_inconclusa",
                     "motivo": "No se pudo comprobar si la carga ya estaba escrita (usuario del bot, proveedor o descripción no únicos)."}
@@ -833,12 +966,16 @@ def cargar_una(cfg: dict[str, str], carga: dict, en_seco: bool, ahora: datetime 
             ref = leer_referencias(cur, propuesta, ahora, cfg, largos)
             plan = gc.planificar(payload, ref, ahora)
             resumen, importe = plan.resumen(), plan.total
+        numeracion = resumen.get("numeracion") if not movimiento else None
         if en_seco:
             con.rollback()
+            if numeracion:
+                resumen["numeracion"] = {**numeracion, "nota": "a confirmar al cargar"}
             return {"estado": "simulada", "plan": resumen}
 
         try:
-            diario_escribir("intento", carga, nombre_base, total=gc.r2(importe))
+            diario_escribir("intento", carga, nombre_base, total=gc.r2(importe),
+                            **({"numeracion": {"punto_venta": numeracion["punto_venta"], "numero": numeracion["numero"]}} if numeracion else {}))
         except OSError as e:
             raise ErrorDiario(f"No se pudo anotar en el diario local: {e}") from e
         if movimiento:
@@ -849,8 +986,11 @@ def cargar_una(cfg: dict[str, str], carga: dict, en_seco: bool, ahora: datetime 
         else:
             escrito = escribir(cur, plan)
             verificar_escrito(cur, plan, escrito)
-            escrito["huella"] = huella(cur, escrito)
+            escrito["huella"] = huella(cur, escrito)  # incluye el punto de venta y el número realmente escritos
             identificador = {"comprobante_id": escrito["comprobantes_compras"][0]}
+            if numeracion:
+                escrito["numeracion"] = {"punto_venta": numeracion["punto_venta"], "numero": numeracion["numero"]}
+                identificador = {**identificador, "punto_venta": numeracion["punto_venta"], "numero": numeracion["numero"]}
         en_commit = True
         con.commit()
         en_commit = False

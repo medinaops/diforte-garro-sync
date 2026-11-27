@@ -39,9 +39,11 @@ class Validacion(unittest.TestCase):
             invalido(self, t, {})
 
     def test_los_sin_args_rechazan_cualquier_clave(self):
-        for tipo in ("version", "estructura", "perfil", "copia_medir"):
+        for tipo in ("version", "estructura", "indices", "perfil", "copia_medir"):
             self.assertEqual(gc.validar(tipo, {}, CFG), {})
+            self.assertEqual(gc.validar(tipo, {"equipo": "PC-1"}, CFG), {"equipo": "PC-1"})
             invalido(self, tipo, {"base": BASE}, texto="desconocidos")
+            invalido(self, tipo, {"tabla": "pagos"}, texto="desconocidos")
             invalido(self, tipo, [], texto="objeto")
             invalido(self, tipo, None)
             invalido(self, tipo, "x")
@@ -129,12 +131,14 @@ class Validacion(unittest.TestCase):
         self.assertLess(len(str(c.exception)), 100)
 
     def test_la_lista_cerrada_es_la_del_diseno_y_coincide_con_la_migracion(self):
-        esperados = {"version", "estructura", "perfil", "copia_medir", "copia_crear", "copia_borrar", "escritor_archivo",
+        esperados = {"version", "estructura", "indices", "perfil", "copia_medir", "copia_crear", "copia_borrar", "escritor_archivo",
                      "comparar", "deshacer", "logs", "actualizar"}
         self.assertEqual(set(gc.TIPOS), esperados)
-        mig = os.path.join(AQUI, "..", "diforte-produccion-control-arca", "supabase", "migrations", "693_garro_comandos.sql")
-        if os.path.exists(mig):  # solo en el workspace de Diforte
-            texto = open(mig, encoding="utf-8").read()
+        base = os.path.join(AQUI, "..", "diforte-produccion-control-arca", "supabase", "migrations")
+        mig = os.path.join(base, "693_garro_comandos.sql")
+        mig2 = os.path.join(base, "695_garro_comandos_indices.sql")
+        if os.path.exists(mig) and os.path.exists(mig2):  # solo en el workspace de Diforte
+            texto = open(mig, encoding="utf-8").read() + open(mig2, encoding="utf-8").read()
             for t in esperados:
                 self.assertIn(f"'{t}'", texto)
 
@@ -149,6 +153,8 @@ class Invocaciones(unittest.TestCase):
         c = ["--config", "/pk/.env"]
         self.assertEqual(self.armar("version", {}), [["/py", s("garro_sync.py"), "--version"], ["/py", s("garro_escritor.py"), "--version"]])
         self.assertEqual(self.armar("estructura", {}), [["/py", s("garro_escritor.py"), "--estructura", *c]])
+        self.assertEqual(self.armar("indices", {}), [["/py", s("garro_indices.py"), *c]])
+        self.assertEqual(self.armar("indices", {"equipo": "PC-1"}), [["/py", s("garro_indices.py"), *c]])
         self.assertEqual(self.armar("perfil", {}), [["/py", s("comparar_movimientos.py"), "--perfil", *c]])
         self.assertEqual(self.armar("copia_medir", {}), [["/py", s("garro_copia.py"), "--medir", *c]])
         self.assertEqual(self.armar("copia_crear", {"base": BASE}), [["/py", s("garro_copia.py"), "--crear", BASE, *c]])

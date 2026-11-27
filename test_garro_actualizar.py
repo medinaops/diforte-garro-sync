@@ -696,6 +696,78 @@ def json_marca(f):
         return json.load(fh)
 
 
+def _git(*args):
+    import subprocess
+    r = subprocess.run(["git", "-C", AQUI, *args], capture_output=True, stdin=subprocess.DEVNULL, timeout=60)
+    if r.returncode != 0:
+        raise unittest.SkipTest("sin git o sin el tag v1.10.0 en este checkout")
+    return r.stdout
+
+
+class DeLaV1_10_0ALaV1_10_1(unittest.TestCase):
+    """La actualización REMOTA de la v1.10.0 (la del tag) a esta versión, con los archivos reales de las dos."""
+
+    VIEJA = "v1.10.0"
+
+    def setUp(self):
+        self.instalador_viejo = _git("show", f"{self.VIEJA}:install.ps1").decode("ascii")
+        self.viejo = ga.leer_instalador(self.instalador_viejo)
+        self.instalador_nuevo = open(os.path.join(AQUI, "install.ps1"), "rb").read()
+        self.nuevo = ga.leer_instalador(self.instalador_nuevo.decode("ascii"))
+        if self.nuevo["version"] == self.VIEJA:
+            self.skipTest("esta versión es la v1.10.0")
+        self.dir = tempfile.mkdtemp(prefix="act-real-")
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.archivos_viejos = {n: _git("show", f"{self.VIEJA}:{n}") for n in self.viejo["hashes"]}
+        for n, b in self.archivos_viejos.items():
+            self.assertEqual(sha(b), self.viejo["hashes"][n], f"{n} del tag no coincide con sus huellas")
+            with open(os.path.join(self.dir, n), "wb") as f:
+                f.write(b)
+        with open(os.path.join(self.dir, "python-verificado.txt"), "w") as f:
+            f.write(f"version={self.viejo['python_version']}\r\nsha256={self.viejo['python_sha256']}\r\n")
+        with open(os.path.join(self.dir, "tareas-version.txt"), "w") as f:
+            f.write(self.viejo["version_tareas"] + "\r\n")
+        self.archivos_nuevos = {n: open(os.path.join(AQUI, n), "rb").read() for n in self.nuevo["hashes"]}
+
+    def test_lo_unico_que_cambia_son_archivos_py_y_no_cambian_python_tareas_ni_garro_recuperar(self):
+        v, n = self.viejo, self.nuevo
+        self.assertEqual((v["python_version"], v["python_sha256"], v["version_tareas"]), (n["python_version"], n["python_sha256"], n["version_tareas"]))
+        for nombre in n["hashes"]:
+            if not nombre.endswith(".py"):
+                self.assertEqual(n["hashes"][nombre], v["hashes"].get(nombre), f"cambió {nombre}, que no es un .py")
+        self.assertEqual(n["hashes"]["garro_recuperar.py"], v["hashes"]["garro_recuperar.py"])
+        self.assertTrue(set(v["hashes"]) <= set(n["hashes"]), "no se puede sacar un archivo del paquete")
+
+    def test_el_actualizar_remoto_la_acepta_y_deja_el_paquete_andando(self):
+        zip_bytes = zip_de(self.nuevo["version"], self.archivos_nuevos)
+        pedidos = []
+        def descargar(url, maximo):
+            pedidos.append(url)
+            return self.instalador_nuevo if url.endswith("install.ps1") else zip_bytes
+        antes_recuperar = open(os.path.join(self.dir, "garro_recuperar.py"), "rb").read()
+        with mock.patch.object(ga, "autochequeo", return_value=(True, "ok")):
+            texto = ga.actualizar({"version": self.nuevo["version"], "sha256_install": sha(self.instalador_nuevo)}, {}, aqui=self.dir,
+                                  config=os.path.join(self.dir, ".env"), python=sys.executable, correr=lambda a, t, e=None: (0, ""),
+                                  descargar=descargar, candado=contextlib.nullcontext, version_actual=self.VIEJA,
+                                  version_python=self.viejo["python_version"], plazo_s=ga.PEOR_CASO_S, comando_id=1)
+        self.assertIn(f"Actualizado de {self.VIEJA} a {self.nuevo['version']}", texto)
+        cambiados = sorted(n for n in self.nuevo["hashes"] if self.archivos_viejos.get(n) != self.archivos_nuevos[n])
+        self.assertTrue(cambiados and all(n.endswith(".py") for n in cambiados), cambiados)
+        for n in self.nuevo["hashes"]:
+            self.assertEqual(open(os.path.join(self.dir, n), "rb").read(), self.archivos_nuevos[n], n)
+        self.assertEqual(open(os.path.join(self.dir, "garro_recuperar.py"), "rb").read(), antes_recuperar)
+        self.assertFalse(os.path.exists(os.path.join(self.dir, gr.MARCA_EN_CURSO)))
+        self.assertEqual(sha(open(os.path.join(self.dir, "supabase-ca-2021.crt"), "rb").read()), self.nuevo["hashes"]["supabase-ca-2021.crt"])
+        # y el código nuevo, ya instalado, arranca de verdad: --version y el argv EXACTO de las dos tareas importando todo
+        codigo, salida = gc.correr_proceso([sys.executable, os.path.join(self.dir, "garro_sync.py"), "--version"], 60, self.dir)
+        self.assertEqual((codigo, salida.strip()), (0, f"garro_sync {self.nuevo['version']}"))
+        for args_tarea in g.ARGV_TAREAS:
+            codigo, salida = gc.correr_proceso([sys.executable, os.path.join(self.dir, "garro_sync.py"), *args_tarea], 60, self.dir,
+                                                {"GARRO_SYNC_AUTOCHEQUEO": "1"})
+            self.assertEqual((codigo, salida.strip()), (0, f"AUTOCHEQUEO ARGV OK {self.nuevo['version']}"), args_tarea)
+        self.assertEqual(len(pedidos), 2)
+
+
 class Candado(unittest.TestCase):
     def conexion(self, toma: bool):
         con = mock.MagicMock()

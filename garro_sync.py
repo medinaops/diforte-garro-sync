@@ -357,7 +357,7 @@ TABLAS: list[tuple[str, str, list[tuple[str, str]]]] = [
 
 ARCHIVO_CONFIG = ".env.garro-sync"
 # Versión del paquete: debe coincidir con $Version de install.ps1 (lo comprueba un test).
-VERSION = "v1.10.0"
+VERSION = "v1.10.1"
 DIR_PAQUETE = os.path.dirname(os.path.abspath(__file__))
 # Argumentos EXACTOS con que arrancan las dos tareas programadas (copia diaria y pedidos; un test los compara con
 # install.ps1). La actualización remota los usa en su autochequeo con GARRO_SYNC_AUTOCHEQUEO=1.

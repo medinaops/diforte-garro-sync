@@ -57,7 +57,7 @@ RE_CARGA_COPIA = re.compile(r"copia-[0-9]{1,12}")
 RE_EQUIPO = re.compile(r"[A-Za-z0-9_.-]{1,60}")
 
 TIMEOUTS = {
-    "version": 60, "estructura": 120, "perfil": 180, "copia_medir": 120, "copia_crear": 25 * 60, "copia_borrar": 300,
+    "version": 60, "estructura": 120, "indices": 120, "perfil": 180, "copia_medir": 120, "copia_crear": 25 * 60, "copia_borrar": 300,
     "escritor_archivo": 180, "comparar": 120, "deshacer": 180, "logs": 30, "actualizar": ga.PEOR_CASO_S,
 }
 TIPOS = tuple(TIMEOUTS)
@@ -139,7 +139,7 @@ def validar(tipo, args, cfg: dict[str, str]) -> dict:
 
 
 def _validar(tipo, args, cfg: dict[str, str]) -> dict:
-    if tipo in ("version", "estructura", "perfil", "copia_medir"):
+    if tipo in ("version", "estructura", "indices", "perfil", "copia_medir"):
         _solo(args, ())
         return {}
     if tipo in ("copia_crear", "copia_borrar"):
@@ -190,6 +190,8 @@ def armar(tipo: str, a: dict, *, python: str, aqui: str, config: str, archivo: s
         return [[python, s("garro_sync.py"), "--version"], [python, s("garro_escritor.py"), "--version"]]
     if tipo == "estructura":
         return [[python, s("garro_escritor.py"), "--estructura", *cfg_arg]]
+    if tipo == "indices":
+        return [[python, s("garro_indices.py"), *cfg_arg]]
     if tipo == "perfil":
         return [[python, s("comparar_movimientos.py"), "--perfil", *cfg_arg]]
     if tipo == "copia_medir":
@@ -606,7 +608,7 @@ def _cerrar_actualizacion_cortada(cfg: dict[str, str], aqui: str) -> None:
 
 # ---------------------------------------------------------------- autochequeo
 
-MODULOS = ("garro_recuperar", "garro_sync", "garro_cargas", "garro_movimientos", "garro_escritor", "garro_copia", "comparar_movimientos",
+MODULOS = ("garro_recuperar", "garro_indices", "garro_sync", "garro_cargas", "garro_movimientos", "garro_escritor", "garro_copia", "comparar_movimientos",
            "relevar_compras", "garro_actualizar", "garro_comandos")
 
 

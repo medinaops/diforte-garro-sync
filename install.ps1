@@ -45,7 +45,7 @@ $ProgressPreference = "SilentlyContinue"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # ---------------------------------------------------------------- constantes
-$Version         = "v1.10.0"
+$Version         = "v1.10.1"
 $Repo            = "medinaops/diforte-garro-sync"
 # Version de lo que define las tareas programadas (seccion "Tareas programadas" de este script: nombres, horarios, repeticion,
 # limite de tiempo, MultipleInstances, tipo de sesion). SUBIRLA cada vez que esa seccion cambie: una actualizacion remota
@@ -65,13 +65,14 @@ $HashesPaquete = @{
     "actualizar-ahora.bat" = "82b5fc5df5775d5d6680c085c5b5f417cc5f7658be8ecc8a3b9029218776e177"
     "comparar_movimientos.py" = "3de754be993c11a7e670bdf8094943e785368890a7e7c4a85e45ad5e1f16b65a"
     "garro_actualizar.py" = "aafe70dc24f419395f9bbecab999893335ef760ecd2018dd3745018fa6352ea9"
-    "garro_cargas.py" = "bbc775b5e834a39900bc21ff60360b4280c8c82cfcc824c4339b4295819f73ce"
-    "garro_comandos.py" = "4876ca601d89c75a5f00a9821c19c177c9acf27cbd35ecbd7b9c86a2d57df218"
+    "garro_cargas.py" = "e02f2d41fabe6ca649fb701b2680ac8d82d701d9f064ea4eaf713f5762a370a9"
+    "garro_comandos.py" = "6f9ad8754e6fe6c2f206134a9a4742bf7890a6b234edab6401474353983d839a"
     "garro_copia.py" = "af865884867187d7a997fdb618336b9bf9b0f83f83a2079fe5bf6da9920b991c"
-    "garro_escritor.py" = "4c4b8f5769e660df8f6e71659eff0701ff72f7f347921dfe4f16d4b3679fc66b"
+    "garro_escritor.py" = "14caddb6a40223eace41f61d1f54212e27ea52cb2f4283de0db9de7bd662b025"
+    "garro_indices.py" = "d5f2f1451dde8099cb21a006b95dfa5af41e79e376bb4972cbc4203f9460e51b"
     "garro_movimientos.py" = "55a202fef5a0d24d5a84c0dea3aa15ab6ab5cebb52f5281c75ad18316e21ff9d"
     "garro_recuperar.py" = "daf51e14803bf670b23a41a5cc6b1a6b1206b06c728d8665c292a8c1b47d7273"
-    "garro_sync.py" = "0000d248d734cbc3e05a000bea7969237dff44b970333f21009b8ff61607bebf"
+    "garro_sync.py" = "209c2cc96fe665b931c7f5451f411d874f1624458ad27d8f1629288d091b74bd"
     "relevar_compras.py" = "ee9eb74799f97ce01be1a794add4da18836dc5b233d9314ba8e2c66d1e656056"
     "requirements.txt" = "b3e919e8eac4bfae6f8d92ab116ee3fef65ce487bc818cbcbb38228be74e3703"
     "supabase-ca-2021.crt" = "700723581420dd1ac98fd7e9ac529f0ef210eadcaf87fc868a3ad7d114c2f3b7"

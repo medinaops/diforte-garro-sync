@@ -11,6 +11,10 @@ Cómo se opera, y por qué está hecho así. La lista de comandos y sus argument
 - **`COMANDOS`**: prendido por defecto (`COMANDOS=0` en `.env.garro-sync` lo apaga).
 - **`garro_sync.py --si-hay-pedido`** (la tarea de cada 5 minutos): `pedido -> cargas -> relevamiento -> comandos`. Los comandos van al final: una actualización remota reemplaza archivos y esa corrida no debe importar nada después.
 
+## Comando `indices` (v1.10.1)
+
+Pregunta, de solo lectura, si Gestión Integral impide cargar dos veces el mismo comprobante: lista, de cada tabla que toca el escritor (más `pagos` y `asientos`), los índices (`pg_get_indexdef`, con los únicos marcados), las restricciones (`pg_get_constraintdef`: PK, UNIQUE, CHECK, FK), los triggers y las reglas. Es un programa aparte (`garro_indices.py`), no el escritor: sesión de solo lectura, solo catálogos de PostgreSQL 9.3 (nada de filas) y tope de 120 s. La salida empieza con un resumen de lo que impediría duplicados (para que sobreviva al recorte a 20.000 caracteres) y sigue con el detalle por tabla. Requiere la migración 695 (amplía la lista de tipos de `garro.comandos`); `select garro.comandos_pedir('indices', '{}');`.
+
 ## Estados
 
 `pendiente -> tomado -> ok | error`; `pendiente -> vencido` (a las 2 h) o `cancelado`; `tomado -> sin_respuesta` (a los 60 min sin resolverse). Lo tomado no se reintenta nunca.
