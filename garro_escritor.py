@@ -104,10 +104,34 @@ def _corto(e: BaseException) -> str:
 
 # ------------------------------------------------------------------ conexión
 
+# Comentario que garro_copia.py le deja a cada copia de prueba que crea: es lo que la distingue de cualquier otra base.
+MARCA_COPIA = "Copia de prueba de garro-sync"
+
+
+def exigir_copia_marcada(cfg: dict[str, str], base: str) -> None:
+    """Toda ESCRITURA con --base exige que esa base sea una copia hecha por garro_copia.py (lleva su marca como
+    comentario de la base), no solo que el nombre lo parezca. Se mira desde la base configurada, solo lectura."""
+    if str(base).strip().lower() == str(cfg.get("GARRO_BASE", "")).strip().lower():
+        raise g.ErrorSync("Esa es la base real: solo se escribe en una copia de prueba.")
+    con = conectar_garro(cfg, solo_lectura=True)
+    try:
+        with con.cursor() as cur:
+            cur.execute("SELECT shobj_description(d.oid, 'pg_database') FROM pg_database AS d WHERE d.datname = %s", (base,))
+            fila = cur.fetchone()
+        con.rollback()
+    finally:
+        con.close()
+    if fila is None or not str(fila[0] or "").startswith(MARCA_COPIA):
+        raise g.ErrorSync(f"La base {base} no es una copia de prueba de este programa (no tiene su marca): no se escribe nada. "
+                          "Las copias se crean con garro_copia.py --crear.")
+
+
 def conectar_garro(cfg: dict[str, str], solo_lectura: bool, base: str | None = None):
     """Conexión a la base del programa. Mismas credenciales y codificación que la copia; `base` pisa GARRO_BASE."""
     import psycopg2
     g.validar_origen(cfg)
+    if base is not None and not solo_lectura:
+        exigir_copia_marcada(cfg, base)
     try:
         con = psycopg2.connect(
             host=cfg["GARRO_HOST"], port=int(cfg["GARRO_PUERTO"]), dbname=base or cfg["GARRO_BASE"],
@@ -1321,6 +1345,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--confirmar", action="store_true", help="con --deshacer: borra de verdad")
     ap.add_argument("--base", help="otra base (una copia) en lugar de GARRO_BASE")
     ap.add_argument("--config", default=os.path.join(AQUI, g.ARCHIVO_CONFIG))
+    ap.add_argument("--version", action="version", version=f"garro_escritor {g.VERSION}")
     args = ap.parse_args(argv)
     if args.escribir and not args.archivo:
         ap.error("--escribir va con --archivo")

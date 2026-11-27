@@ -36,7 +36,7 @@ El instalador, en `%LOCALAPPDATA%\Diforte\garro-sync\` (por usuario, con permiso
 
 ### Actualizar el programa
 
-Correr **el mismo comando** otra vez: baja la versión fijada en el script y conserva la configuración y los logs.
+Correr **el mismo comando** otra vez: baja la versión fijada en el script y conserva la configuración y los logs. Desde la v1.10.0, y si no cambia Python, las tareas ni las dependencias, también se puede pedir a distancia (ver «Pedidos remotos»).
 
 ### Opciones
 
@@ -71,6 +71,63 @@ El relevamiento (`relevar_compras.py`) se corre igual, desde la carpeta de insta
 
 - **En la PC:** doble clic en **Actualizar Garro ahora** (escritorio). Corre la copia, muestra el resultado y espera una tecla.
 - **Desde el sistema** de Diforte (Costos > Gastos > «Actualizar ahora», solo administración): la PC lo toma en menos de 5 minutos. Si estaba apagada, el pedido espera hasta 24 horas. Si la copia falla, el pedido se reintenta solo cada 5 minutos, hasta 3 intentos (si lo rechaza la guardia, no se reintenta): después queda como fallido y se puede pedir otro. Una copia diaria o manual también atiende el pedido pendiente.
+
+## Pedidos remotos (desde la v1.10.0)
+
+Después de instalar la v1.10.0 **una vez** en el servidor, lo demás se pide desde la nube: la tarea de cada 5 minutos, al final de su pasada (después del pedido «Actualizar ahora», las cargas y el relevamiento), toma **un** pedido de la cola `garro.comandos` de Supabase (migración 693), lo corre y sube el resultado. Está **prendido por defecto** (es el objetivo: no hace falta tocar nada del servidor); se apaga con `COMANDOS=0` en `.env.garro-sync`. Detalle de diseño y operación en `docs/pedidos-remotos.md`.
+
+**Cómo se pide** (solo como `postgres`, por psql; ninguna persona de la app puede pedirlos) y cómo se lee el resultado:
+
+```sql
+select garro.comandos_pedir('estructura', '{}');            -- devuelve el id del pedido
+select id, tipo, estado, resultado->>'codigo_salida' as codigo, resultado->>'salida' as salida
+  from garro.comandos order by id desc limit 5;            -- estado: pendiente, tomado, ok, error, vencido, sin_respuesta o cancelado
+select garro.comandos_cancelar(<id>);                       -- solo un pendiente
+```
+
+Lo normal es verlo resuelto en menos de 5 minutos. Un pendiente que no se tomó en 2 horas pasa a `vencido`; uno tomado que no se resolvió en 60 minutos (el servidor se cayó a mitad) pasa a `sin_respuesta`. **Lo tomado nunca se vuelve a correr**: si hace falta, se pide de nuevo.
+
+**La lista cerrada** (no hay otra forma de correr nada; cada tipo rechaza claves desconocidas y arma una lista de argumentos para un programa de este paquete, nunca un texto para un shell):
+
+| Tipo | Qué corre | Args |
+|---|---|---|
+| `version` | `--version` de `garro_sync.py` y `garro_escritor.py` | ninguno |
+| `estructura` | `garro_escritor.py --estructura` (solo lectura) | ninguno |
+| `perfil` | `comparar_movimientos.py --perfil` (solo lectura) | ninguno |
+| `copia_medir` | `garro_copia.py --medir` (solo lectura) | ninguno |
+| `copia_crear` | `garro_copia.py --crear` | `base` |
+| `copia_borrar` | `garro_copia.py --borrar` | `base` |
+| `escritor_archivo` | `garro_escritor.py --archivo` con el `payload` en un archivo temporal que se borra | `payload` (objeto, ≤ 20 KB), `escribir` (bool, por defecto `false`), `base` |
+| `comparar` | `comparar_movimientos.py --base ... --humano ... --bot ...` | `base`, `humano` (int), `bot` (int), `otro_tipo` (bool) |
+| `deshacer` | `garro_escritor.py --deshacer ... --base ...` | `carga_id` (solo `copia-...`), `base`, `confirmar` (bool) |
+| `logs` | últimas N líneas de `garro_sync.log` (y del `.1`) | `lineas` (1 a 400, por defecto 100) |
+| `actualizar` | actualiza el paquete (abajo) | `version` (`vN.N.N`), `sha256_install` (64 hex) |
+
+Cualquier tipo acepta además `equipo` (nombre de la PC): si viene, solo lo toma esa PC; la fila guarda en `equipo` qué PC lo tomó.
+
+**Lo que nunca se puede hacer:**
+
+- **Escribir en la base real de Garro.** `base` tiene que ser el nombre de una copia de prueba **y la base tiene que llevar la marca que deja `garro_copia.py --crear`** (su comentario): sin la marca, `garro_escritor.py` se niega a escribir o a borrar con `--base`, también a mano; el nombre solo no alcanza. El nombre es: `gestion_prueba`, o `gestion_prueba…_prueba` (tiene que cumplir además el patrón de `garro_copia.py`: terminar en `_prueba`), y distinto de `GARRO_BASE`. `escritor_archivo` con `escribir` exige `base`; sin `escribir` es la simulación de siempre (solo lee la base real); `deshacer` solo acepta cargas `copia-...`. El servidor valida de nuevo todo lo que llega, aunque venga de la cola ya validado.
+- **Correr comandos libres**, ni tocar archivos fuera del paquete (`logs` lee solo `garro_sync.log` de la carpeta del programa).
+- **Subir secretos.** Antes de subir cualquier salida se reemplaza por `***` cada valor secreto de `.env.garro-sync` (contraseñas, claves y cadenas de conexión, también codificados para URL, en minúscula o mayúscula, escapados como JSON o `repr()` y la contraseña de una cadena de conexión tal cual y decodificada; **no se redactan valores de menos de 4 caracteres: las contraseñas tienen que tener al menos 4**); la salida se recorta a 20.000 caracteres y el resultado a 64 KB.
+
+El resultado de cada comando es `{codigo_salida, salida, segundos, version}`; `codigo_salida` 0 → estado `ok`, cualquier otro → `error` con la salida adentro (`-1` = no corrió o se cortó por tiempo). Cada tipo tiene su tope de tiempo y ninguno pasa de los 28 minutos contados desde que arrancó la tarea (que Windows corta a los 30): lo que queda de esos 28 minutos acota a cada comando. `copia_crear` (tope 25 minutos) **no corre** si lo que queda es menos que su tope: se resuelve `error` «pedila de nuevo». `actualizar` tiene un peor caso de 490 segundos y tampoco empieza si queda menos. Al empezar `copia_medir` y `copia_crear`, y después de cortar una copia, se borran los `copia-*.dump` huérfanos (el mensaje lo dice). `version` reparte un solo tope entre sus dos invocaciones. Dos corridas no ejecutan comandos a la vez (candado del sistema operativo; la tarea además no se superpone consigo misma). Un comando que falla no toca la copia de datos ni las cargas. Si la base de Supabase todavía no tiene la migración 693, se ignora con una línea en el log por hora.
+
+### Actualizar el programa a distancia (`actualizar`)
+
+Reemplaza **solo los archivos `.py` del paquete**. No re-registra tareas, no toca Python, la configuración, el certificado ni las dependencias: si la versión nueva necesita algo de eso, el comando termina en `error` con «requiere instalar en el equipo» y hay que correr el instalador en el servidor.
+
+1. Publicar el tag de la versión (con `python3 actualizar_hashes.py` hecho antes) y calcular la huella de **su** `install.ps1` **desde el checkout local ya revisado, nunca bajándola de GitHub**:
+   ```
+   git -C diforte-garro-sync show v1.11.0:install.ps1 | shasum -a 256
+   ```
+2. `select garro.comandos_pedir('actualizar', '{"version":"v1.11.0","sha256_install":"<la huella>"}');`
+
+Lo que hace el servidor: rechaza si el plazo que queda de la corrida es menor que el peor caso, si hay una actualización anterior sin cerrar o si la versión pedida es **menor** que la instalada (bajar de versión solo se hace en el equipo; la misma versión repara si hay diferencias). Baja el `install.ps1` del **tag pedido** (no de `main`) y verifica la huella; lee de él `$Version` (tiene que ser la pedida), `$HashesPaquete`, la versión de Python y `$VersionTareas`; rechaza la actualización si cambia el Python, `$VersionTareas` (la versión de lo que define las tareas, que `install.ps1` deja en `tareas-version.txt`), `garro_recuperar.py` o cualquier archivo que no sea un `.py` (el certificado, `requirements.txt`, el `.bat`); baja el zip del tag, verifica cada archivo contra `$HashesPaquete` y lo arma en una carpeta de staging (si la red falla antes de este punto no se tocó nada). Después, con el candado de la copia en Supabase tomado (si hay una copia en curso no actualiza): respalda los archivos actuales en `actualizacion-respaldo\` (con `copy2`), escribe la marca `actualizacion-en-curso` (versión vieja y nueva, archivos, cuáles ya existían y el id del comando) y los reemplaza (y borra su `__pycache__`). **Suelta el candado de la copia** y corre el autochequeo con el código nuevo en subprocesos, cada uno con su tope (20 s las cuatro comprobaciones de versión y de arranque, 60 s el autochequeo del paquete): `--version` igual a la pedida, el argv EXACTO de las dos tareas programadas con `GARRO_SYNC_AUTOCHEQUEO=1` (solo parsea e importa todos los módulos de esos caminos) y el autochequeo del paquete (import de todo y una lectura de Garro y de Supabase que no escribe nada). Si falla, restaura el respaldo, vuelve a chequear y devuelve `error` con el detalle; si sale bien, borra la marca y devuelve `ok` con la versión vieja y la nueva (`version_nueva` en el resultado).
+
+**Si el proceso muere a mitad** (corte de luz, tarea matada): queda la marca. `garro_sync.py` la mira al arrancar (tareas y copia diaria), antes de importar el resto del paquete, usando `garro_recuperar.py` (solo biblioteca estándar, **nunca se reemplaza a distancia**): si ningún otro proceso está actualizando (candado `comandos.lock` libre), restaura los archivos desde el respaldo, deja `actualizacion-recuperada.json`, escribe una línea en el log y relanza la corrida con los archivos ya consistentes (una sola vez: el hijo lleva `GARRO_SYNC_RELANZADO=1` y nunca vuelve a relanzar; si la marca no se puede borrar o vuelve a aparecer, es «incompleta»). La recuperación corre antes que `argparse` y que cualquier import del paquete. Antes de restaurar verifica el sha256 de cada archivo del respaldo contra la marca: si no coincide, no toca nada. La siguiente pasada de comandos cierra con `error` la fila que había quedado `tomado`, con un resultado que lo explica. Mientras hay una marca sin resolver, la corrida solo hace el latido y deja un log claro (nada de copia, cargas ni relevamiento) y los comandos no toman ninguno nuevo: si había uno tomado se resuelve con un error que lo explica; hace falta instalar en el equipo. Si al terminar bien no se pudo borrar la marca, se la reescribe con `estado: ok` y la recuperación la borra sin restaurar nada. El respaldo, los archivos nuevos y la marca se fuerzan a disco (`fsync`) antes de reemplazar.
+
+Los comandos van al final de la pasada a propósito: después de reemplazar archivos, esa corrida no importa nada más del paquete.
 
 ## Relevamiento de compras
 
@@ -185,6 +242,7 @@ Antes de vaciar el espejo se valida lo leído. Si algo no cierra, **no se public
   ```
   python\python.exe garro_sync.py --prueba           # lee Garro y cuenta filas; no escribe nada
   python\python.exe garro_sync.py --prueba-destino   # prueba la conexión y la contraseña de Supabase; no escribe nada
+  python\python.exe garro_sync.py --version          # versión instalada (también de garro_escritor.py y garro_comandos.py)
   python\python.exe garro_sync.py                    # copia completa
   python\python.exe garro_sync.py --si-hay-pedido    # lo que hace la tarea de cada 5 minutos
   python\python.exe garro_sync.py --forzar           # copia saltando la guardia (solo manual)
@@ -202,12 +260,12 @@ Antes de vaciar el espejo se valida lo leído. Si algo no cierra, **no se public
 ## Mantenimiento (publicar una versión)
 
 1. Dejar los archivos como van a quedar en el tag y correr los tests: `python -m pytest -q`.
-2. Regenerar las huellas que `install.ps1` verifica (garro_sync.py, actualizar-ahora.bat, requirements.txt y la CA):
+2. Regenerar las huellas que `install.ps1` verifica (los `.py` del paquete, actualizar-ahora.bat, requirements.txt y la CA):
 
    ```
    python3 actualizar_hashes.py
    ```
 
    (`python3 actualizar_hashes.py --verificar` solo comprueba; los tests también lo hacen.)
-3. Si cambió la versión, actualizar `$Version` en `install.ps1`, hacer commit y crear el tag con ese nombre.
+3. Si cambió la versión, actualizar `$Version` en `install.ps1` **y `VERSION` en `garro_sync.py`** (un test las compara), hacer commit y crear el tag con ese nombre. Si tocaste la sección «Tareas programadas» de `install.ps1`, subir también `$VersionTareas` (un test avisa si esa sección cambia): así una actualización remota se rechaza y pide instalar en el equipo.
 4. Cambiar qué se copia (`TABLAS` en `garro_sync.py`): va una migración nueva en el repo de la base **antes** de publicar la versión nueva; si no, la copia falla entera y queda la anterior. `python garro_sync.py --ddl` imprime el SQL de las tablas.

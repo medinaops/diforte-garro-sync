@@ -32,7 +32,7 @@ import garro_escritor as ge
 import garro_sync as g
 
 AQUI = os.path.dirname(os.path.abspath(__file__))
-MARCA = "Copia de prueba de garro-sync"
+MARCA = ge.MARCA_COPIA
 NOMBRE_VALIDO = re.compile(r"^[a-z][a-z0-9_]{2,40}_prueba$")
 TABLAS_DE_CONTROL = ("comprobantes_compras", "items_comprobantes_compras", "asientos_contables", "pagos", "proveedores")
 # Si durante la copia el disco baja de esto, se corta: un disco lleno tira abajo el servidor de la base.

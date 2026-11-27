@@ -45,8 +45,12 @@ $ProgressPreference = "SilentlyContinue"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # ---------------------------------------------------------------- constantes
-$Version         = "v1.9.0"
+$Version         = "v1.10.0"
 $Repo            = "medinaops/diforte-garro-sync"
+# Version de lo que define las tareas programadas (seccion "Tareas programadas" de este script: nombres, horarios, repeticion,
+# limite de tiempo, MultipleInstances, tipo de sesion). SUBIRLA cada vez que esa seccion cambie: una actualizacion remota
+# (comando "actualizar") compara esta version con la instalada y, si difiere, se rechaza ("requiere instalar en el equipo").
+$VersionTareas  = "1"
 # Por usuario: en C:\ cualquier usuario puede crear carpetas y plantar un python.exe; en LOCALAPPDATA no.
 $Dir             = Join-Path $env:LOCALAPPDATA "Diforte\garro-sync"
 # Python aislado: paquete NuGet oficial (zip). No toca el registro ni pisa un Python del usuario.
@@ -60,11 +64,14 @@ $PythonSha256    = "0eb85c2dfccccf1b17352de4c397f69194035b7d37149eacc16f1147d93d
 $HashesPaquete = @{
     "actualizar-ahora.bat" = "82b5fc5df5775d5d6680c085c5b5f417cc5f7658be8ecc8a3b9029218776e177"
     "comparar_movimientos.py" = "3de754be993c11a7e670bdf8094943e785368890a7e7c4a85e45ad5e1f16b65a"
+    "garro_actualizar.py" = "aafe70dc24f419395f9bbecab999893335ef760ecd2018dd3745018fa6352ea9"
     "garro_cargas.py" = "bbc775b5e834a39900bc21ff60360b4280c8c82cfcc824c4339b4295819f73ce"
-    "garro_copia.py" = "1934854cb2ef5d51408e5c3041dfbbdbb185228116010f2b5157926f48111918"
-    "garro_escritor.py" = "12eb4498da7764f0cb1418e5a6b3fd4951904e0ddf9215a95caea9cff61c697c"
+    "garro_comandos.py" = "4876ca601d89c75a5f00a9821c19c177c9acf27cbd35ecbd7b9c86a2d57df218"
+    "garro_copia.py" = "af865884867187d7a997fdb618336b9bf9b0f83f83a2079fe5bf6da9920b991c"
+    "garro_escritor.py" = "4c4b8f5769e660df8f6e71659eff0701ff72f7f347921dfe4f16d4b3679fc66b"
     "garro_movimientos.py" = "55a202fef5a0d24d5a84c0dea3aa15ab6ab5cebb52f5281c75ad18316e21ff9d"
-    "garro_sync.py" = "b8e462274f9638d38139606a8e70b9a444a46790693700fabd9d3f8b37ed31dd"
+    "garro_recuperar.py" = "daf51e14803bf670b23a41a5cc6b1a6b1206b06c728d8665c292a8c1b47d7273"
+    "garro_sync.py" = "0000d248d734cbc3e05a000bea7969237dff44b970333f21009b8ff61607bebf"
     "relevar_compras.py" = "ee9eb74799f97ce01be1a794add4da18836dc5b233d9314ba8e2c66d1e656056"
     "requirements.txt" = "b3e919e8eac4bfae6f8d92ab116ee3fef65ce487bc818cbcbb38228be74e3703"
     "supabase-ca-2021.crt" = "700723581420dd1ac98fd7e9ac529f0ef210eadcaf87fc868a3ad7d114c2f3b7"
@@ -522,6 +529,8 @@ try {
         throw "La tarea '$TareaPedidos' quedo con una repeticion inesperada (intervalo '$($rep.Interval)', duracion '$dur'; se esperaba PT5M y duracion vacia o P3650D). Avisa a Alexander."
     }
     Ok "$TareaPedidos (cada 5 minutos, repeticion: intervalo $($rep.Interval), duracion '$($rep.Duration)' - vacia = indefinida)"
+    # Queda registrada la version de las tareas: la actualizacion remota la compara con la del install.ps1 del tag.
+    Set-Content -Path (Join-Path $Dir "tareas-version.txt") -Value $VersionTareas -Encoding Ascii
 } catch {
     $motivo = $_.Exception.Message
     $sinRestaurar = New-Object System.Collections.ArrayList

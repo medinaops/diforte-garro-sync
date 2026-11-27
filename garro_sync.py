@@ -356,6 +356,15 @@ TABLAS: list[tuple[str, str, list[tuple[str, str]]]] = [
 ]
 
 ARCHIVO_CONFIG = ".env.garro-sync"
+# Versión del paquete: debe coincidir con $Version de install.ps1 (lo comprueba un test).
+VERSION = "v1.10.0"
+DIR_PAQUETE = os.path.dirname(os.path.abspath(__file__))
+# Argumentos EXACTOS con que arrancan las dos tareas programadas (copia diaria y pedidos; un test los compara con
+# install.ps1). La actualización remota los usa en su autochequeo con GARRO_SYNC_AUTOCHEQUEO=1.
+ARGV_TAREAS = ([], ["--si-hay-pedido"])
+# Los módulos que importa cualquiera de los caminos de las tareas.
+MODULOS_DE_LAS_TAREAS = ("garro_recuperar", "garro_cargas", "garro_escritor", "garro_movimientos", "garro_comandos",
+                         "garro_actualizar", "garro_copia", "comparar_movimientos", "relevar_compras")
 LOG_LOCAL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "garro_sync.log")
 # Clave fija del candado: dos corridas de garro-sync nunca la toman a la vez.
 CLAVE_LOCK = 329001
@@ -1063,12 +1072,16 @@ def correr_prueba_destino(cfg: dict[str, str]) -> bool:
 def correr_pedido(config: str) -> int:
     """Modo de la tarea de cada 5 minutos: latido y, si hay un pedido, copia normal con la guardia.
 
-    Pase lo que pase con el pedido, después hace una pasada de la cola de cargas (apagada por defecto) y una del
-    relevamiento automático (ninguna cambia el resultado).
+    Pase lo que pase con el pedido, después hace una pasada de la cola de cargas (apagada por defecto), una del
+    relevamiento automático y, al final, una de los pedidos remotos (garro_comandos: un comando por corrida). Ninguna
+    cambia el resultado. Los pedidos remotos van últimos a propósito: una actualización remota reemplaza archivos del
+    paquete, y después de eso este proceso no tiene que importar nada más.
     """
+    inicio = time.monotonic()
     codigo = _atender_pedido(config)
     cargas_auto(config)
     relevamiento_auto(config)
+    comandos_auto(config, inicio)
     return codigo
 
 
@@ -1099,6 +1112,19 @@ def relevamiento_auto(config: str) -> None:
     except (Exception, SystemExit) as e:  # SystemExit: relevar_compras corta así si la clave está dañada
         escribir_traza(limitar=True)
         decir(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} (relevamiento) ERROR: {type(e).__name__}: {e}")
+
+
+def comandos_auto(config: str, inicio: float | None = None) -> None:
+    """Mejor esfuerzo: un pedido remoto por corrida (apagado con COMANDOS=0). Cualquier falla queda en el log."""
+    try:
+        cfg = leer_archivo(config)
+        if cfg.get("COMANDOS", "1").strip() == "0":
+            return
+        import garro_comandos  # acá y no arriba: garro_comandos importa garro_sync
+        garro_comandos.pasada(cfg, config, inicio=inicio)
+    except (Exception, SystemExit) as e:
+        escribir_traza(limitar=True)
+        decir(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} (comandos) ERROR: {type(e).__name__}: {e}")
 
 
 def _atender_pedido(config: str) -> int:
@@ -1137,7 +1163,69 @@ def _atender_pedido(config: str) -> int:
         return 0 if registrar_error(cfg, corrida, mensaje) else 1
 
 
+VARIABLE_RELANZADO = "GARRO_SYNC_RELANZADO"
+# Con estos argumentos (o con GARRO_SYNC_AUTOCHEQUEO=1) no se recupera nada: son consultas y comprobaciones, y el
+# autochequeo de una actualización los corre con la marca puesta.
+SIN_RECUPERAR = ("--version", "--prueba", "--prueba-destino", "--ddl", "-h", "--help")
+
+
+def _recuperar_al_arrancar() -> bool:
+    """Lo PRIMERO que hace main (antes de argparse y de importar cualquier otro módulo del paquete): si una
+    actualización remota quedó a medias (la marca `actualizacion-en-curso`), restaura el respaldo con
+    garro_recuperar.py (que nunca se reemplaza a distancia) y vuelve a lanzar esta misma corrida, UNA vez, con los
+    archivos ya consistentes. Devuelve True si la marca sigue sin resolver: entonces la corrida no hace nada más que
+    avisar (ver `_corrida_con_marca`)."""
+    marca = os.path.join(DIR_PAQUETE, "actualizacion-en-curso")
+    try:
+        import garro_recuperar
+        resultado = garro_recuperar.recuperar(DIR_PAQUETE)
+        pendiente = garro_recuperar.marca_sin_resolver(DIR_PAQUETE)
+    except Exception:
+        escribir_traza(limitar=True)
+        resultado, pendiente = None, os.path.exists(marca)
+    if resultado == "recuperada" and not pendiente:
+        if os.environ.get(VARIABLE_RELANZADO) == "1":
+            return True  # ya es el relanzamiento y la marca volvió a aparecer: nunca en cadena
+        import subprocess
+        sys.exit(subprocess.call([sys.executable, *sys.argv], env={**os.environ, VARIABLE_RELANZADO: "1"}))
+    return pendiente or resultado == "incompleta"
+
+
+def _corrida_con_marca(args) -> int:
+    """Hay una actualización a medias que no se pudo restaurar: no se copia, ni se cargan comprobantes, ni se relevan
+    compras. Solo el latido (para que se vea que la PC está viva) y un log claro; si había un comando tomado se lo
+    resuelve con un error que lo explica. Hace falta instalar en el equipo."""
+    marca_dir = DIR_PAQUETE
+    decir(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ERROR: hay una actualización a medias que no se pudo restaurar "
+          "(marca actualizacion-en-curso): no se copia, no se cargan comprobantes ni se leen compras. "
+          "Hace falta correr el instalador en el equipo.")
+    if args.si_hay_pedido:
+        try:
+            cfg = leer_archivo(args.config)
+            latido_agente(cfg)
+            import garro_comandos
+            garro_comandos.informar_marca(cfg, marca_dir)
+        except Exception as e:
+            escribir_traza(limitar=True)
+            decir(f"(con marca) no se pudo informar: {type(e).__name__}")
+    return 1
+
+
+def _autochequeo_de_argv() -> int:
+    """Con GARRO_SYNC_AUTOCHEQUEO=1 el programa solo parsea sus argumentos (ya se parsearon) e importa todo lo que
+    usan las tareas: no lee ni escribe nada."""
+    import importlib
+    for m in MODULOS_DE_LAS_TAREAS:
+        importlib.import_module(m)
+    print(f"AUTOCHEQUEO ARGV OK {VERSION}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
+    crudo = sys.argv[1:] if argv is None else list(argv)
+    con_marca = False
+    if os.environ.get("GARRO_SYNC_AUTOCHEQUEO") != "1" and not any(a in SIN_RECUPERAR for a in crudo):
+        con_marca = _recuperar_al_arrancar()  # antes de argparse: un error al leer los argumentos no la saltea
     ap = argparse.ArgumentParser(description="Copia Gestión Integral → Supabase (schema garro)")
     ap.add_argument("--prueba", action="store_true", help="solo lee el origen y cuenta filas")
     ap.add_argument("--si-hay-pedido", action="store_true",
@@ -1147,6 +1235,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--forzar", action="store_true",
                     help="saltea la guardia de la foto (solo uso manual; nunca en tareas programadas)")
     ap.add_argument("--ddl", action="store_true", help="imprime el SQL de las tablas espejo")
+    ap.add_argument("--version", action="version", version=f"garro_sync {VERSION}")
     ap.add_argument("--config", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), ARCHIVO_CONFIG))
     args = ap.parse_args(argv)
     if args.forzar and (args.si_hay_pedido or args.prueba or args.prueba_destino):
@@ -1157,6 +1246,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.ddl:
         print(ddl())
         return 0
+
+    if os.environ.get("GARRO_SYNC_AUTOCHEQUEO") == "1":
+        return _autochequeo_de_argv()
+    if con_marca and (args.si_hay_pedido or not (args.prueba or args.prueba_destino)):
+        return _corrida_con_marca(args)
 
     try:
         sys.stdout.reconfigure(errors="replace")  # consolas de Windows sin UTF-8

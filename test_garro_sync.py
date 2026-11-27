@@ -859,6 +859,7 @@ class ModoPedido(unittest.TestCase):
                     mock.patch.object(g, "leer_archivo", return_value=dict(CFG)), \
                     mock.patch.object(g, "leer_origen", side_effect=origen_falso(filas=filas)) as lo, \
                     mock.patch.object(g, "relevamiento_auto"), \
+                    mock.patch.object(g, "comandos_auto"), \
                     mock.patch.object(g, "conectar_destino", side_effect=con):
                 codigo = g.main(argv or ["--si-hay-pedido", "--config", "x"])
             ruta = os.path.join(ruta_tmp, "log")
@@ -1019,6 +1020,7 @@ class ModoPedido(unittest.TestCase):
                 mock.patch.object(g, "leer_archivo", return_value=dict(CFG)), \
                 mock.patch.object(g, "leer_origen", side_effect=origen_falso(filas=self.vacia())), \
                 mock.patch.object(g, "relevamiento_auto"), \
+                    mock.patch.object(g, "comandos_auto"), \
                 mock.patch.object(g, "conectar_destino", side_effect=abrir):
             g.main(["--si-hay-pedido", "--config", "x"])
         self.assertEqual(n[0], 4)  # latido, copia, fallo_pedido y registro de error
@@ -1534,11 +1536,13 @@ class RelevamientoAutomatico(unittest.TestCase):
                         mock.patch.object(g, "LOG_LOCAL", os.path.join(tmp, "log")), \
                         mock.patch.object(g, "leer_archivo", return_value=dict(CFG)), \
                         mock.patch.object(g, "_atender_pedido", return_value=0), \
+                        mock.patch.object(g, "comandos_auto"), \
                         mock.patch.dict(sys.modules, {"relevar_compras": fake}):
                     self.assertEqual(g.correr_pedido("x"), 0)
                     pass
                 self.assertTrue(any("(relevamiento) ERROR" in m for m in self.mensajes))
         with mock.patch.object(g, "_atender_pedido", return_value=1), \
+                mock.patch.object(g, "comandos_auto"), \
                 mock.patch.object(g, "relevamiento_auto") as ra:
             self.assertEqual(g.correr_pedido("x"), 1)  # el código del pedido pasa tal cual
             ra.assert_called_once_with("x")

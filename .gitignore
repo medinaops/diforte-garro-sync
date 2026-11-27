@@ -10,3 +10,13 @@ cargas-diario.jsonl
 cargas.lock
 copia-*.dump
 garro_sync.log.traza
+comandos.lock
+comandos.aviso
+comando-*.json
+tareas-version.txt
+actualizacion-respaldo/
+actualizacion-staging/
+*.nuevo
+actualizacion-en-curso
+actualizacion-en-curso.tmp
+actualizacion-recuperada.json

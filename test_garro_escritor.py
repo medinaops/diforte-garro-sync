@@ -191,6 +191,7 @@ class CargasAuto(Base):
             with mock.patch.object(g, "leer_archivo", return_value={"CARGAS": "1"}), \
                     mock.patch.object(g, "_atender_pedido", return_value=0), \
                     mock.patch.object(g, "relevamiento_auto"), \
+                    mock.patch.object(g, "comandos_auto"), \
                     mock.patch.dict(sys.modules, {"garro_escritor": fake}):
                 self.assertEqual(g.correr_pedido("x"), 0)
         self.assertIn("(cargas) ERROR", open(g.LOG_LOCAL, encoding="utf-8").read())
@@ -199,9 +200,10 @@ class CargasAuto(Base):
         orden = []
         with mock.patch.object(g, "_atender_pedido", side_effect=lambda c: orden.append("pedido") or 1), \
                 mock.patch.object(g, "cargas_auto", side_effect=lambda c: orden.append("cargas")), \
-                mock.patch.object(g, "relevamiento_auto", side_effect=lambda c: orden.append("relevamiento")):
+                mock.patch.object(g, "relevamiento_auto", side_effect=lambda c: orden.append("relevamiento")), \
+                mock.patch.object(g, "comandos_auto", side_effect=lambda c, inicio=None: orden.append("comandos")):
             self.assertEqual(g.correr_pedido("x"), 1)
-        self.assertEqual(orden, ["pedido", "cargas", "relevamiento"])
+        self.assertEqual(orden, ["pedido", "cargas", "relevamiento", "comandos"])
 
 
 class Insertar(Base):
