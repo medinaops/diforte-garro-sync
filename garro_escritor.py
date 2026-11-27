@@ -1,7 +1,7 @@
-"""Carga de comprobantes de compra en Gestión Integral: escritor.
+"""Carga de comprobantes de compra y de movimientos de fondos en Gestión Integral: escritor.
 
-Escribe en la base del programa lo que planificó `garro_cargas.py`, igual que lo hace el programa cuando una
-persona carga la compra a mano. Es la única parte de garro-sync que escribe en Garro, así que está encerrada:
+Escribe en la base del programa lo que planificaron `garro_cargas.py` (compras) y `garro_movimientos.py` (egresos
+de fondos en efectivo o por transferencia), igual que lo hace el programa cuando una persona los carga a mano. Es la única parte de garro-sync que escribe en Garro, así que está encerrada:
 
   - APAGADA por defecto: hace falta `CARGAS=1` en el .env, y para escribir de verdad también `CARGAS_REAL=1`
     (además del interruptor del lado de Supabase). Sin las dos llaves, todo se procesa en seco.
@@ -13,7 +13,7 @@ persona carga la compra a mano. Es la única parte de garro-sync que escribe en 
 Uso:
     python garro_escritor.py --pasada                         # lo que hace la tarea de cada 5 minutos
     python garro_escritor.py --estructura                     # prueba la instalación (solo lectura)
-    python garro_escritor.py --archivo carga.json             # planifica una carga en solo lectura
+    python garro_escritor.py --archivo carga.json             # planifica una carga (compra o movimiento) en solo lectura
     python garro_escritor.py --archivo carga.json --escribir --base OTRA   # la escribe en una COPIA de la base
     python garro_escritor.py --deshacer N [--confirmar]       # borra lo que escribió la carga N
 """
@@ -28,8 +28,10 @@ import os
 import sys
 import time
 from datetime import date, datetime
+from decimal import Decimal
 
 import garro_cargas as gc
+import garro_movimientos as gm
 import garro_sync as g
 
 AQUI = os.path.dirname(os.path.abspath(__file__))
@@ -43,6 +45,13 @@ TOLERANCIA_TOTAL = 0.01
 TOLERANCIA_ASIENTO = 0.005
 LOCK_TABLAS = ("LOCK TABLE comprobantes_compras, asientos_contables, pagos_en_comprobantes_compras "
                "IN SHARE ROW EXCLUSIVE MODE")
+# Un movimiento de fondos solo necesita que nadie dé de alta otro mientras se buscan duplicados. Las tablas de sus
+# medios (efectivo y movimientos bancarios) también las escriben los recibos y los pagos del programa: no se bloquean,
+# para no frenarlos; la carga las relee y las verifica antes de confirmar.
+LOCK_TABLAS_MOVIMIENTO = "LOCK TABLE movimientos_fondos IN SHARE ROW EXCLUSIVE MODE"
+CLASE_COMPRA, CLASE_MOVIMIENTO = "compra", gm.CLASE
+CLASES_DE_LA_COLA = (CLASE_COMPRA, CLASE_MOVIMIENTO)
+COLUMNAS_TODAS = {**gc.COLUMNAS, **gm.COLUMNAS}
 
 # Orden de las tablas hijas en `escrito` (y, al revés, el de borrado).
 TABLAS_ESCRITO = (
@@ -124,10 +133,13 @@ def conectar_garro(cfg: dict[str, str], solo_lectura: bool, base: str | None = N
 
 # ------------------------------------------------------------------ estructura
 
-def verificar_estructura(cur) -> dict[str, int | None]:
+def verificar_estructura(cur, columnas: dict | None = None, tipos: dict | None = None) -> dict[str, int | None]:
     """Las tablas que se tocan tienen EXACTAMENTE las columnas (y tipos) de la receta, sin triggers ni reglas.
+    Cada receta (compras, movimientos de fondos) verifica solo sus tablas: un cambio en una no frena la otra.
     Devuelve los largos máximos de las columnas de texto: {"tabla.columna": largo o None}."""
-    tablas = list(gc.COLUMNAS)
+    columnas = gc.COLUMNAS if columnas is None else columnas
+    tipos = gc.TIPOS if tipos is None else tipos
+    tablas = list(columnas)
     cur.execute("""SELECT table_name, column_name, character_maximum_length, data_type FROM information_schema.columns
                    WHERE table_schema = 'public' AND table_name = ANY(%s)""", (tablas,))
     reales: dict[str, set[str]] = {t: set() for t in tablas}
@@ -136,10 +148,10 @@ def verificar_estructura(cur) -> dict[str, int | None]:
     for tabla, columna, largo, tipo in cur.fetchall():
         reales[tabla].add(columna)
         largos[f"{tabla}.{columna}"] = largo
-        esperado = gc.TIPOS.get(tabla, {}).get(columna)
+        esperado = tipos.get(tabla, {}).get(columna)
         if esperado is not None and tipo != esperado:
             problemas.append(f"{tabla}.{columna}: es {tipo} y se esperaba {esperado}")
-    for tabla, esperadas in gc.COLUMNAS.items():
+    for tabla, esperadas in columnas.items():
         if not reales[tabla]:
             problemas.append(f"{tabla}: la tabla no existe")
             continue
@@ -300,7 +312,7 @@ def _insertar(cur, tabla: str, fila: dict, **claves) -> int:
     if repetidas:
         raise ErrorPlan(f"{tabla}: el plan ya trae {', '.join(sorted(repetidas))}")
     completa = {**fila, **claves}
-    pk, *columnas = gc.COLUMNAS[tabla]
+    pk, *columnas = COLUMNAS_TODAS[tabla]
     if set(completa) != set(columnas):
         faltan, sobran = sorted(set(columnas) - set(completa)), sorted(set(completa) - set(columnas))
         raise ErrorPlan(f"{tabla}: el plan no coincide con la receta (faltan {faltan}, de más {sobran})")
@@ -427,16 +439,171 @@ def verificar_escrito(cur, plan: gc.Plan, escrito: dict) -> None:
         raise AssertionError("Las imputaciones de pagos superan el total del comprobante.")
 
 
-def huella(cur, escrito: dict) -> str:
+def huella(cur, escrito: dict, tablas: tuple[str, ...] = TABLAS_ESCRITO) -> str:
     """sha256 del contenido de TODAS las filas escritas (columnas de la receta, orden estable por id). Si una
     persona toca cualquiera en el programa, la huella cambia."""
     partes = []
-    for tabla in TABLAS_ESCRITO:
-        pk, *_ = gc.COLUMNAS[tabla]
-        cur.execute(f'SELECT {", ".join(gc.COLUMNAS[tabla])} FROM public."{tabla}" WHERE {pk} = ANY(%s) ORDER BY {pk}',
+    for tabla in tablas:
+        pk, *_ = COLUMNAS_TODAS[tabla]
+        cur.execute(f'SELECT {", ".join(COLUMNAS_TODAS[tabla])} FROM public."{tabla}" WHERE {pk} = ANY(%s) ORDER BY {pk}',
                     (sorted(escrito[tabla]),))
         partes.append([tabla, [[repr(v) for v in fila] for fila in cur.fetchall()]])
     return hashlib.sha256(json.dumps(partes, ensure_ascii=True).encode("ascii")).hexdigest()
+
+
+# ------------------------------------------------------------------ movimientos de fondos
+
+# Importe de un movimiento de fondos: la suma de sus tres medios (efectivo por su equivalente en pesos, banco en
+# valor absoluto y otro medio), como la migración 666; NULL si no tiene ninguno. `m` es la tabla de movimientos.
+_MEDIOS_DEL_MOVIMIENTO = """
+      (SELECT count(*) FROM efectivo_medio_de_pago_en_movimientos_fondos v WHERE v.fk_id_movimiento_fondo = m.id_movimiento_fondo)
+    + (SELECT count(*) FROM movimientos_cuenta_bancaria_en_movimientos_fondos v WHERE v.fk_id_movimiento_fondo = m.id_movimiento_fondo)
+    + (SELECT count(*) FROM otro_medio_de_pago_en_movimientos_fondos v WHERE v.fk_id_movimiento_fondo = m.id_movimiento_fondo)"""
+_IMPORTE_DEL_MOVIMIENTO = """
+      coalesce((SELECT sum(e.imp_efectivo_medio_de_pago::numeric * coalesce(e.imp_equivalente_peso, 1)::numeric)
+                FROM efectivo_medio_de_pago_en_movimientos_fondos AS v
+                JOIN efectivo_medio_de_pago AS e ON e.id_efectivo_medio_de_pago = v.fk_id_efectivo_medio_de_pago
+                WHERE v.fk_id_movimiento_fondo = m.id_movimiento_fondo), 0)
+    + coalesce((SELECT sum(abs(b.imp_movimiento_cuenta_bancaria::numeric))
+                FROM movimientos_cuenta_bancaria_en_movimientos_fondos AS v
+                JOIN movimientos_cuentas_bancarias AS b ON b.id_movimiento_cuenta_bancaria = v.fk_id_movimiento_cuenta_bancaria
+                WHERE v.fk_id_movimiento_fondo = m.id_movimiento_fondo), 0)
+    + coalesce((SELECT sum(coalesce(o.imp_otro_medio_de_pago, 0)::numeric)
+                FROM otro_medio_de_pago_en_movimientos_fondos AS v
+                JOIN otro_medio_de_pago AS o ON o.id_otro_medio_de_pago = v.fk_id_otro_medio_de_pago
+                WHERE v.fk_id_movimiento_fondo = m.id_movimiento_fondo), 0)"""
+# Los del mismo tipo (todo el historial) y los egresos de cualquier tipo a ±10 días de hoy.
+_MOVIMIENTOS_PARECIDOS = f"""
+    SELECT m.id_movimiento_fondo, m.fk_id_movimiento_fondo_tipo, m.des_movimiento_fondo, m.fec_movimiento_fondo, m.es_egreso,
+           CASE WHEN ({_MEDIOS_DEL_MOVIMIENTO}) = 0 THEN NULL ELSE round(({_IMPORTE_DEL_MOVIMIENTO}), 2) END
+    FROM movimientos_fondos AS m
+    WHERE m.fec_movimiento_fondo IS NOT NULL
+      AND (m.fk_id_movimiento_fondo_tipo = %s OR (m.es_egreso AND abs(m.fec_movimiento_fondo::date - %s::date) <= {gm.DIAS_OTRO_TIPO}))
+    ORDER BY m.id_movimiento_fondo
+"""
+
+
+def leer_referencias_movimiento(cur, propuesta, ahora: datetime, cfg: dict[str, str], largos: dict[str, int | None]) -> gm.Referencias:
+    """Lo que el planificador de movimientos necesita saber de la base, leído dentro de la transacción de la carga."""
+    p = propuesta if isinstance(propuesta, dict) else {}
+    tipo = None
+    existentes: list[dict] = []
+    tipo_id = gc._entero(p.get("tipo_mov_id"))
+    if tipo_id is not None:
+        cur.execute("""SELECT id_movimiento_fondo_tipo, des_movimiento_fondo_tipo, es_ingreso, es_egreso, genera_asiento
+                       FROM movimientos_fondos_tipos WHERE id_movimiento_fondo_tipo = %s""", (tipo_id,))
+        fila = cur.fetchone()
+        if fila:
+            tipo = {"id": fila[0], "descripcion": fila[1], "es_ingreso": fila[2], "es_egreso": fila[3],
+                    "genera_asiento": fila[4]}
+        if tipo_id in gm.TIPOS_HABILITADOS:
+            cur.execute(_MOVIMIENTOS_PARECIDOS, (tipo_id, ahora.date()))
+            existentes = [{"id": r[0], "tipo": r[1], "descripcion": r[2], "fecha": r[3], "egreso": r[4],
+                           "importe": None if r[5] is None else float(r[5])} for r in cur.fetchall()]
+
+    cur.execute("SELECT id_operario FROM operarios WHERE nombre_usuario = %s AND habilitado",
+                (cfg.get("CARGAS_OPERARIO", OPERARIO_POR_DEFECTO),))
+    filas = cur.fetchall()
+    operario_id = filas[0][0] if len(filas) == 1 else None
+
+    cur.execute("SELECT id_caja, habilitada FROM cajas WHERE id_caja = %s", (gm.CAJA,))
+    fila = cur.fetchone()
+    caja = {"id": fila[0], "habilitada": fila[1]} if fila else None
+
+    cuenta = None
+    cuenta_id = gc._entero(p.get("cuenta_bancaria_id"))
+    if cuenta_id is not None:
+        cur.execute("""SELECT id_cuenta_bancaria, es_activa, fk_id_plan_de_cuenta FROM cuentas_bancarias
+                       WHERE id_cuenta_bancaria = %s""", (cuenta_id,))
+        fila = cur.fetchone()
+        if fila:
+            cuenta = {"id": fila[0], "activa": fila[1], "plan": fila[2]}
+    return gm.Referencias(tipo=tipo, operario_id=operario_id, caja=caja, cuenta_bancaria=cuenta,
+                          existentes=existentes, largos=dict(largos))
+
+
+def escribir_movimiento(cur, plan: gm.Plan) -> dict:
+    """Escribe el plan de un movimiento (sin commit) y devuelve los ids creados por tabla."""
+    escrito: dict = {t: [] for t in gm.TABLAS_ESCRITO}
+    movimiento = _insertar(cur, "movimientos_fondos", plan.movimiento)
+    escrito["movimientos_fondos"].append(movimiento)
+    tabla_medio, tabla_vinculo = plan.tablas_medio
+    medio = _insertar(cur, tabla_medio, plan.medio_fila)
+    clave_medio = ("fk_id_efectivo_medio_de_pago" if plan.medio == "efectivo" else "fk_id_movimiento_cuenta_bancaria")
+    vinculo = _insertar(cur, tabla_vinculo, plan.vinculo, fk_id_movimiento_fondo=movimiento, **{clave_medio: medio})
+    escrito[tabla_medio].append(medio)
+    escrito[tabla_vinculo].append(vinculo)
+    escrito["clase"] = CLASE_MOVIMIENTO
+    return escrito
+
+
+def _ids_hijos_movimiento(cur, movimiento_id: int) -> dict[str, list[int]]:
+    """Lo que HOY cuelga del movimiento, con las mismas claves que `escrito` (listas ordenadas)."""
+    cur.execute("SELECT id_movimiento_fondo FROM movimientos_fondos WHERE id_movimiento_fondo = %s", (movimiento_id,))
+    propio = sorted(r[0] for r in cur.fetchall())
+    cur.execute("""SELECT id_efectivo_medio_de_pago_en_movimiento_fondo, fk_id_efectivo_medio_de_pago
+                   FROM efectivo_medio_de_pago_en_movimientos_fondos WHERE fk_id_movimiento_fondo = %s""", (movimiento_id,))
+    efectivo = cur.fetchall()
+    cur.execute("""SELECT id_movimiento_cuenta_bancaria_en_movimiento_fondo, fk_id_movimiento_cuenta_bancaria
+                   FROM movimientos_cuenta_bancaria_en_movimientos_fondos WHERE fk_id_movimiento_fondo = %s""", (movimiento_id,))
+    banco = cur.fetchall()
+    return {
+        "movimientos_fondos": propio,
+        "efectivo_medio_de_pago": sorted(r[1] for r in efectivo),
+        "efectivo_medio_de_pago_en_movimientos_fondos": sorted(r[0] for r in efectivo),
+        "movimientos_cuentas_bancarias": sorted(r[1] for r in banco),
+        "movimientos_cuenta_bancaria_en_movimientos_fondos": sorted(r[0] for r in banco),
+    }
+
+
+def _esperadas_movimiento(plan: gm.Plan, escrito: dict) -> dict[str, dict]:
+    """Las filas completas que tendrían que haber quedado, por tabla: las del plan más las claves entre filas."""
+    t_medio, t_vinculo = plan.tablas_medio
+    clave_medio = "fk_id_efectivo_medio_de_pago" if plan.medio == "efectivo" else "fk_id_movimiento_cuenta_bancaria"
+    mid, medio_id = escrito["movimientos_fondos"][0], escrito[t_medio][0]
+    return {
+        "movimientos_fondos": {gm.COLUMNAS["movimientos_fondos"][0]: mid, **plan.movimiento},
+        t_medio: {gm.COLUMNAS[t_medio][0]: medio_id, **plan.medio_fila},
+        t_vinculo: {gm.COLUMNAS[t_vinculo][0]: escrito[t_vinculo][0], "fk_id_movimiento_fondo": mid, clave_medio: medio_id,
+                    **plan.vinculo},
+    }
+
+
+def _igual(esperado, leido) -> bool:
+    """Un importe se compara en centavos; el resto, tal cual (None incluido)."""
+    if isinstance(esperado, float) or isinstance(leido, (float, Decimal)):
+        return esperado is not None and leido is not None and _centavos(esperado) == _centavos(leido)
+    return esperado == leido
+
+
+def verificar_movimiento(cur, plan: gm.Plan, escrito: dict) -> None:
+    """Relee lo escrito (misma transacción, antes del COMMIT) y comprueba que cierra: cada fila COMPLETA contra la del
+    plan (todas las columnas de la receta, con los importes en centavos), los vínculos y que no haya asiento. Si no:
+    excepción → ROLLBACK."""
+    mid = escrito["movimientos_fondos"][0]
+    hijos = _ids_hijos_movimiento(cur, mid)
+    for tabla in gm.TABLAS_ESCRITO:
+        if hijos[tabla] != sorted(escrito[tabla]):
+            raise AssertionError(f"Lo escrito en {tabla} no coincide con lo que quedó en la base.")
+    otras = gm.TABLAS_BANCO if plan.medio == "efectivo" else gm.TABLAS_EFECTIVO
+    if any(hijos[t] for t in otras):
+        raise AssertionError("Quedó escrito un medio de pago que el plan no tenía.")
+
+    for tabla, esperada in _esperadas_movimiento(plan, escrito).items():
+        columnas = gm.COLUMNAS[tabla]
+        cur.execute(f'SELECT {", ".join(columnas)} FROM public."{tabla}" WHERE {columnas[0]} = %s', (esperada[columnas[0]],))
+        filas = cur.fetchall()
+        if len(filas) != 1:
+            raise AssertionError(f"La fila releída de {tabla} no es una sola.")
+        distintas = [c for c, v in zip(columnas, filas[0]) if not _igual(esperada[c], v)]
+        if distintas:
+            raise AssertionError(f"La fila releída de {tabla} no coincide con el plan ({', '.join(distintas)}).")
+
+    cur.execute("""SELECT count(*) FROM asientos_contables
+                   WHERE fk_id_movimiento_fondo = %s OR fk_id_movimiento_cuenta_bancaria = ANY(%s)""",
+                (mid, hijos["movimientos_cuentas_bancarias"] or [0]))
+    if cur.fetchone()[0]:
+        raise AssertionError("Hay un asiento colgado del movimiento: el plan no tenía ninguno.")
 
 
 # ------------------------------------------------------------------ diario local
@@ -526,6 +693,40 @@ def _buscar_lo_propio(cfg: dict[str, str], propuesta: dict, base: str | None) ->
         con.close()
 
 
+def _buscar_movimiento_propio(cfg: dict[str, str], propuesta: dict, base: str | None) -> tuple[int | None, bool]:
+    """Para una retomada: ¿el bot ya escribió este movimiento? Mismo usuario del bot, mismo tipo, misma descripción
+    exacta, misma fecha y el mismo importe en centavos (sumando sus medios). Solo lectura y sin LOCK. Devuelve
+    (id o None, conclusiva): `conclusiva` es False si no se pudo saber."""
+    tipo_id = gc._entero(propuesta.get("tipo_mov_id"))
+    descripcion = gc.limpiar_texto(propuesta.get("descripcion")) if isinstance(propuesta.get("descripcion"), str) else ""
+    importe = gm._importe_valido(propuesta.get("importe"))
+    fecha = propuesta.get("fecha")
+    try:
+        fecha = date.fromisoformat(fecha) if isinstance(fecha, str) else None
+    except ValueError:
+        fecha = None
+    if tipo_id is None or not descripcion or importe is None or fecha is None:
+        return None, False
+    con = conectar_garro(cfg, solo_lectura=True, base=base)
+    try:
+        cur = con.cursor()
+        cur.execute("SELECT id_operario FROM operarios WHERE nombre_usuario = %s AND habilitado",
+                    (cfg.get("CARGAS_OPERARIO", OPERARIO_POR_DEFECTO),))
+        operarios = cur.fetchall()
+        if len(operarios) != 1:
+            return None, False
+        cur.execute(f"""SELECT m.id_movimiento_fondo FROM movimientos_fondos AS m
+                        WHERE m.fk_id_operario = %s AND m.fk_id_movimiento_fondo_tipo = %s AND m.des_movimiento_fondo = %s
+                          AND m.fec_movimiento_fondo::date = %s AND round(({_IMPORTE_DEL_MOVIMIENTO}) * 100) = %s
+                        ORDER BY 1""", (operarios[0][0], tipo_id, descripcion, fecha, _centavos(importe)))
+        filas = cur.fetchall()
+        if len(filas) > 1:
+            return None, False
+        return (filas[0][0] if filas else None), True
+    finally:
+        con.close()
+
+
 def _incierta(resultado: dict, retomada: bool) -> dict:
     """En una retomada, lo que no sea «escrita ahora» ni un rechazo posterior a una búsqueda concluyente no se
     resuelve: no se sabe si quedó algo escrito."""
@@ -544,15 +745,24 @@ def cargar_una(cfg: dict[str, str], carga: dict, en_seco: bool, ahora: datetime 
     payload = carga.get("payload") if isinstance(carga.get("payload"), dict) else {}
     propuesta = payload.get("propuesta") if isinstance(payload.get("propuesta"), dict) else {}
     nombre_base = _base_de(cfg, base)
+    clase_propuesta, clase_cola = propuesta.get("clase"), carga.get("clase")
+    clase = clase_propuesta or clase_cola or CLASE_COMPRA
+    if clase not in CLASES_DE_LA_COLA or (clase_propuesta and clase_cola and clase_propuesta != clase_cola):
+        return {"estado": "rechazada", "codigo": "clase",
+                "motivo": "La clase de la carga no es una de las que se cargan, o no coincide entre la cola y la propuesta."}
+    movimiento = clase == CLASE_MOVIMIENTO
     # Una retomada de una carga real puede haber escrito antes de cortarse: LO PRIMERO es buscar lo propio,
     # aunque ahora la escritura esté apagada en esta instalación (si no, quedaría como rechazada por «ya cargado»
     # algo que cargó el bot). Una carga en seco nunca escribió nada: no busca y se simula normal.
     retomada_real = bool(carga.get("retomada")) and carga.get("modo") == "real"
     retomada = retomada_real and not en_seco
 
-    if retomada_real:
+    # Un movimiento solo se toma por propio si ESTA carga dejó un «intento» en el diario de esta base: sin intento nunca
+    # empezó a escribir y se planifica como una carga nueva.
+    intento = diario_ultimo(carga.get("id"), ("intento",), nombre_base) if movimiento else True
+    if retomada_real and intento:
         try:
-            existente, conclusiva = _buscar_lo_propio(cfg, propuesta, base)
+            existente, conclusiva = (_buscar_movimiento_propio if movimiento else _buscar_lo_propio)(cfg, propuesta, base)
         except Exception as e:
             g.escribir_traza()
             g.decir(f"{_ahora_txt()} (cargas) carga {carga.get('id')}: no se pudo buscar lo ya escrito: {_corto(e)}")
@@ -560,40 +770,63 @@ def cargar_una(cfg: dict[str, str], carga: dict, en_seco: bool, ahora: datetime 
                     "motivo": "No se pudo comprobar si la carga ya estaba escrita; el detalle está en el log local."}
         if existente is not None:
             previo = diario_ultimo(carga.get("id"), ("cargada",), nombre_base)
-            return {"estado": "cargada", "comprobante_id": existente, "recuperada": True,
+            id_propio = {"clase": CLASE_MOVIMIENTO, "movimiento_id": existente} if movimiento else {"comprobante_id": existente}
+            return {"estado": "cargada", **id_propio, "recuperada": True,
                     "escrito": previo.get("escrito") if previo else None}
         if not conclusiva:
             return {"estado": "indeterminado", "codigo": "busqueda_inconclusa",
-                    "motivo": "No se pudo comprobar si la carga ya estaba escrita (usuario del bot o proveedor no únicos)."}
-        if (diario_ultimo(carga.get("id"), ("cargada", "deshecha"), nombre_base) or {}).get("evento") == "cargada":
+                    "motivo": "No se pudo comprobar si la carga ya estaba escrita (usuario del bot, proveedor o descripción no únicos)."}
+        cierre = (diario_ultimo(carga.get("id"), ("cargada", "deshecha"), nombre_base) or {}).get("evento")
+        if movimiento and cierre is None:
+            # Hubo un intento, no consta que se haya confirmado ni deshecho y ahora no se encuentra nada: no se sabe si
+            # el COMMIT se hizo y alguien lo borró, o si no llegó. No se replanifica.
+            return {"estado": "indeterminado", "codigo": "intento_sin_resultado",
+                    "motivo": "El diario local tiene un intento de esta carga sin resultado y no se encuentra nada en el programa."}
+        if cierre == "cargada":
             # El diario dice que esta carga SÍ se escribió y ahora no está: alguien la anuló en el programa.
             # No se vuelve a escribir algo que una persona decidió borrar: queda para revisar.
             return {"estado": "indeterminado", "codigo": "escrita_y_ya_no_esta",
-                    "motivo": "La carga figura como escrita en el diario local y el comprobante ya no está en el programa."}
+                    "motivo": "La carga figura como escrita en el diario local y ya no está en el programa."}
 
     con = None
     en_commit = False
     try:
         con = conectar_garro(cfg, solo_lectura=en_seco, base=base)
         cur = con.cursor()
-        largos = verificar_estructura(cur)
-        if not en_seco:
-            # Con las tablas bloqueadas, ni los duplicados, ni los restos de los pagos ni el número de asiento
-            # cambian hasta el COMMIT.
-            cur.execute(LOCK_TABLAS)
-        ref = leer_referencias(cur, propuesta, ahora, cfg, largos)
-        plan = gc.planificar(payload, ref, ahora)
+        if movimiento:
+            largos = verificar_estructura(cur, gm.COLUMNAS, gm.TIPOS)
+            if not en_seco:
+                cur.execute(LOCK_TABLAS_MOVIMIENTO)
+            ref_mov = leer_referencias_movimiento(cur, propuesta, ahora, cfg, largos)
+            plan_mov = gm.planificar(propuesta, ref_mov, ahora, payload.get("total_pesos"))
+            resumen, importe = plan_mov.resumen(), plan_mov.importe
+        else:
+            largos = verificar_estructura(cur)
+            if not en_seco:
+                # Con las tablas bloqueadas, ni los duplicados, ni los restos de los pagos ni el número de asiento
+                # cambian hasta el COMMIT.
+                cur.execute(LOCK_TABLAS)
+            ref = leer_referencias(cur, propuesta, ahora, cfg, largos)
+            plan = gc.planificar(payload, ref, ahora)
+            resumen, importe = plan.resumen(), plan.total
         if en_seco:
             con.rollback()
-            return {"estado": "simulada", "plan": plan.resumen()}
+            return {"estado": "simulada", "plan": resumen}
 
         try:
-            diario_escribir("intento", carga, nombre_base, total=gc.r2(plan.total))
+            diario_escribir("intento", carga, nombre_base, total=gc.r2(importe))
         except OSError as e:
             raise ErrorDiario(f"No se pudo anotar en el diario local: {e}") from e
-        escrito = escribir(cur, plan)
-        verificar_escrito(cur, plan, escrito)
-        escrito["huella"] = huella(cur, escrito)
+        if movimiento:
+            escrito = escribir_movimiento(cur, plan_mov)
+            verificar_movimiento(cur, plan_mov, escrito)
+            escrito["huella"] = huella(cur, escrito, gm.TABLAS_ESCRITO)
+            identificador = {"clase": CLASE_MOVIMIENTO, "movimiento_id": escrito["movimientos_fondos"][0]}
+        else:
+            escrito = escribir(cur, plan)
+            verificar_escrito(cur, plan, escrito)
+            escrito["huella"] = huella(cur, escrito)
+            identificador = {"comprobante_id": escrito["comprobantes_compras"][0]}
         en_commit = True
         con.commit()
         en_commit = False
@@ -602,8 +835,7 @@ def cargar_una(cfg: dict[str, str], carga: dict, en_seco: bool, ahora: datetime 
         except OSError:
             g.escribir_traza()
             g.decir(f"{_ahora_txt()} (cargas) AVISO: no se pudo anotar en el diario local la carga {carga.get('id')}.")
-        return {"estado": "cargada", "comprobante_id": escrito["comprobantes_compras"][0],
-                "escrito": escrito, "plan": plan.resumen()}
+        return {"estado": "cargada", **identificador, "escrito": escrito, "plan": resumen}
     except gc.NoCargable as e:
         _rollback(con)
         return {"estado": "rechazada", "codigo": e.codigo, "motivo": e.mensaje}
@@ -654,7 +886,12 @@ def _destino(cfg: dict[str, str], sql: str, params: tuple = ()):
 
 
 def cola_tomar(cfg: dict[str, str]) -> dict | None:
-    return _destino(cfg, "SELECT garro.cargas_tomar()")
+    """Toma la próxima carga de las clases que esta versión sabe escribir (compras y movimientos de fondos)."""
+    try:
+        return _destino(cfg, "SELECT garro.cargas_tomar(ARRAY['compra','movimiento_fondo'])")
+    except ColaSinFunciones:
+        # La cola todavía no tiene la versión con clases (migración pendiente): las compras siguen como siempre.
+        return _destino(cfg, "SELECT garro.cargas_tomar()")
 
 
 def cola_resolver(cfg: dict[str, str], carga_id: int, estado: str, resultado: dict) -> None:
@@ -816,13 +1053,22 @@ def _escrito_de_la_carga(cfg: dict[str, str], carga_id, copia: str | None) -> di
 
 
 def _normalizar_escrito(escrito: dict) -> dict:
-    salida: dict = {}
-    for tabla in TABLAS_ESCRITO:
+    clase = escrito.get("clase", CLASE_COMPRA)
+    if clase not in CLASES_DE_LA_COLA:
+        raise ErrorDeshacer("escrito_invalido", "El registro de lo escrito es de una clase desconocida.")
+    tablas = gm.TABLAS_ESCRITO if clase == CLASE_MOVIMIENTO else TABLAS_ESCRITO
+    salida: dict = {"clase": clase}
+    for tabla in tablas:
         lista = escrito.get(tabla, [])
         if not isinstance(lista, list) or not all(isinstance(x, int) and not isinstance(x, bool) for x in lista):
             raise ErrorDeshacer("escrito_invalido", f"El registro de lo escrito no es válido ({tabla}).")
         salida[tabla] = sorted(lista)
-    if len(salida["comprobantes_compras"]) != 1:
+    if clase == CLASE_MOVIMIENTO:
+        n = lambda ts: [len(salida[t]) for t in ts]  # noqa: E731
+        efectivo, banco = n(gm.TABLAS_EFECTIVO), n(gm.TABLAS_BANCO)
+        if len(salida["movimientos_fondos"]) != 1 or sorted((efectivo, banco)) != [[0, 0], [1, 1]]:
+            raise ErrorDeshacer("escrito_invalido", "El registro de lo escrito no tiene un único movimiento con un único medio.")
+    elif len(salida["comprobantes_compras"]) != 1:
         raise ErrorDeshacer("escrito_invalido", "El registro de lo escrito no tiene un único comprobante.")
     if not isinstance(escrito.get("huella"), str) or not escrito["huella"]:
         raise ErrorDeshacer("escrito_invalido", "El registro de lo escrito no trae la huella de su contenido.")
@@ -834,24 +1080,68 @@ def _comillas(nombre: str) -> str:
     return '"' + nombre.replace('"', '""') + '"'
 
 
-def _filas_colgadas(cur, escrito: dict) -> list[str]:
+def _filas_colgadas(cur, escrito: dict, apuntan: dict[str, str] | None = None) -> list[str]:
     """Tablas del programa (cualquiera que tenga una columna que apunte a lo que escribimos) con filas colgadas
     que NO escribimos nosotros: por ejemplo un producto vinculado al renglón o una nota de crédito aplicada."""
+    apuntan = COLUMNAS_QUE_APUNTAN if apuntan is None else apuntan
     cur.execute("""SELECT c.table_name, c.column_name FROM information_schema.columns AS c
                    JOIN information_schema.tables AS t ON t.table_schema = c.table_schema AND t.table_name = c.table_name
                    WHERE c.table_schema = 'public' AND t.table_type = 'BASE TABLE' AND c.column_name = ANY(%s)
-                   ORDER BY 1, 2""", (list(COLUMNAS_QUE_APUNTAN),))
+                   ORDER BY 1, 2""", (list(apuntan),))
     colgadas = []
     for tabla, columna in cur.fetchall():
-        ids = escrito[COLUMNAS_QUE_APUNTAN[columna]]
+        ids = escrito[apuntan[columna]]
         if not ids:
             continue
         sql = f"SELECT count(*) FROM public.{_comillas(tabla)} WHERE {_comillas(columna)} = ANY(%s)"
         params: list = [ids]
-        if tabla in gc.COLUMNAS:  # las filas propias no cuentan
-            pk = gc.COLUMNAS[tabla][0]
+        if tabla in COLUMNAS_TODAS:  # las filas propias no cuentan
+            pk = COLUMNAS_TODAS[tabla][0]
             sql += f" AND {pk} <> ALL(%s)"
-            params.append(escrito[tabla] or [0])
+            params.append(escrito.get(tabla) or [0])
+        cur.execute(sql, params)
+        if cur.fetchone()[0]:
+            colgadas.append(f"{tabla}.{columna}")
+    return colgadas
+
+
+# Nombres de columna (por prefijo) que apuntan al movimiento o a sus medios, aunque no tengan una FK declarada.
+PREFIJOS_QUE_APUNTAN_MOVIMIENTO = (("fk_id_efectivo_medio_de_pago", "efectivo_medio_de_pago"),
+                                   ("fk_id_movimiento_cuenta_bancaria", "movimientos_cuentas_bancarias"))
+
+
+def _filas_colgadas_movimiento(cur, escrito: dict) -> list[str]:
+    """Filas de otras tablas que usan lo que escribió un movimiento (un pago, un recibo, un asiento, una conciliación...).
+    Se buscan por las claves foráneas declaradas hacia las cinco tablas (pg_constraint) y por el nombre de la columna
+    (`fk_id_movimiento_fondo`, y los que empiezan con `fk_id_efectivo_medio_de_pago` o `fk_id_movimiento_cuenta_bancaria`)."""
+    destinos: dict[tuple[str, str], str] = {}
+    cur.execute("""SELECT cl.relname, a.attname, rf.relname
+                   FROM pg_constraint c
+                   JOIN pg_class cl ON cl.oid = c.conrelid JOIN pg_namespace n ON n.oid = cl.relnamespace
+                   JOIN pg_class rf ON rf.oid = c.confrelid
+                   JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey)
+                   WHERE c.contype = 'f' AND n.nspname = 'public' AND rf.relname = ANY(%s)""", (list(gm.TABLAS_ESCRITO),))
+    for tabla, columna, referida in cur.fetchall():
+        destinos[(tabla, columna)] = referida
+    cur.execute("""SELECT c.table_name, c.column_name FROM information_schema.columns AS c
+                   JOIN information_schema.tables AS t ON t.table_schema = c.table_schema AND t.table_name = c.table_name
+                   WHERE c.table_schema = 'public' AND t.table_type = 'BASE TABLE'""")
+    for tabla, columna in cur.fetchall():
+        if columna == "fk_id_movimiento_fondo":
+            destinos.setdefault((tabla, columna), "movimientos_fondos")
+        for prefijo, referida in PREFIJOS_QUE_APUNTAN_MOVIMIENTO:
+            if columna.startswith(prefijo):
+                destinos.setdefault((tabla, columna), referida)
+    colgadas = []
+    for (tabla, columna), referida in sorted(destinos.items()):
+        ids = escrito.get(referida)
+        if not ids:
+            continue
+        sql = f"SELECT count(*) FROM public.{_comillas(tabla)} WHERE {_comillas(columna)} = ANY(%s)"
+        params: list = [ids]
+        if tabla in COLUMNAS_TODAS:  # las filas propias no cuentan
+            sql += f" AND {COLUMNAS_TODAS[tabla][0]} <> ALL(%s)"
+            params.append(escrito.get(tabla) or [0])
         cur.execute(sql, params)
         if cur.fetchone()[0]:
             colgadas.append(f"{tabla}.{columna}")
@@ -867,50 +1157,67 @@ def deshacer(cfg: dict[str, str], carga_id, confirmar: bool, base: str | None = 
     con = None
     try:
         escrito = _normalizar_escrito(_escrito_de_la_carga(cfg, carga_id, copia))
+        movimiento = escrito["clase"] == CLASE_MOVIMIENTO
+        tablas = gm.TABLAS_ESCRITO if movimiento else TABLAS_ESCRITO
         con = conectar_garro(cfg, solo_lectura=not confirmar, base=copia)
         cur = con.cursor()
-        verificar_estructura(cur)
-        if confirmar:
-            cur.execute(LOCK_TABLAS)
-        cid = escrito["comprobantes_compras"][0]
-        cur.execute("SELECT estado_comprobante_compra, fk_id_operario FROM comprobantes_compras "
-                    "WHERE id_comprobante_compra = %s", (cid,))
-        fila = cur.fetchone()
+        if movimiento:
+            verificar_estructura(cur, gm.COLUMNAS, gm.TIPOS)
+            if confirmar:
+                cur.execute(LOCK_TABLAS_MOVIMIENTO)
+                # Las cinco filas quedan tomadas hasta el COMMIT: nadie las edita ni las usa entre la comparación y el borrado.
+                for t in gm.TABLAS_ESCRITO:
+                    if escrito[t]:
+                        cur.execute(f'SELECT 1 FROM public."{t}" WHERE {COLUMNAS_TODAS[t][0]} = ANY(%s) ORDER BY {COLUMNAS_TODAS[t][0]} FOR UPDATE',
+                                    (escrito[t],))
+            cid = escrito["movimientos_fondos"][0]
+            cur.execute("SELECT fk_id_operario FROM movimientos_fondos WHERE id_movimiento_fondo = %s", (cid,))
+            fila = cur.fetchone()
+            etiqueta, clave_id = f"El movimiento {cid}", "movimiento_id"
+        else:
+            verificar_estructura(cur)
+            if confirmar:
+                cur.execute(LOCK_TABLAS)
+            cid = escrito["comprobantes_compras"][0]
+            cur.execute("SELECT estado_comprobante_compra, fk_id_operario FROM comprobantes_compras "
+                        "WHERE id_comprobante_compra = %s", (cid,))
+            fila = cur.fetchone()
+            etiqueta, clave_id = f"El comprobante {cid}", "comprobante_id"
         if fila is None:
-            raise ErrorDeshacer("no_existe", f"El comprobante {cid} ya no existe en el programa.")
+            raise ErrorDeshacer("no_existe", f"{etiqueta} ya no existe en el programa.")
         cur.execute("SELECT id_operario FROM operarios WHERE nombre_usuario = %s AND habilitado",
                     (cfg.get("CARGAS_OPERARIO", OPERARIO_POR_DEFECTO),))
         operarios = cur.fetchall()
-        if fila[0] != "activo":
-            raise ErrorDeshacer("no_activo", f"El comprobante {cid} no está activo.")
-        if len(operarios) != 1 or fila[1] != operarios[0][0]:
-            raise ErrorDeshacer("no_es_del_bot", f"El comprobante {cid} no lo cargó el usuario del bot.")
-        hijos = _ids_hijos(cur, cid)
-        for tabla in TABLAS_ESCRITO:
+        if not movimiento and fila[0] != "activo":
+            raise ErrorDeshacer("no_activo", f"{etiqueta} no está activo.")
+        if len(operarios) != 1 or fila[-1] != operarios[0][0]:
+            raise ErrorDeshacer("no_es_del_bot", f"{etiqueta} no lo cargó el usuario del bot.")
+        hijos = _ids_hijos_movimiento(cur, cid) if movimiento else _ids_hijos(cur, cid)
+        for tabla in tablas:
             if hijos[tabla] != escrito[tabla]:
-                raise ErrorDeshacer("modificado", f"El comprobante {cid} fue modificado en el programa "
+                raise ErrorDeshacer("modificado", f"{etiqueta} fue modificado en el programa "
                                                   f"({tabla}): anularlo desde el programa.")
-        if huella(cur, escrito) != escrito["huella"]:
-            raise ErrorDeshacer("modificado", f"El comprobante {cid} fue modificado en el programa "
+        if huella(cur, escrito, tablas) != escrito["huella"]:
+            raise ErrorDeshacer("modificado", f"{etiqueta} fue modificado en el programa "
                                               "(cambió el contenido de alguna fila): anularlo desde el programa.")
-        colgadas = _filas_colgadas(cur, escrito)
+        colgadas = _filas_colgadas_movimiento(cur, escrito) if movimiento else _filas_colgadas(cur, escrito)
         if colgadas:
-            raise ErrorDeshacer("dependencias", f"Hay filas de otras tablas colgadas del comprobante {cid} "
-                                                f"({', '.join(colgadas)}): anularlo desde el programa.")
-        borraria = {t: len(escrito[t]) for t in TABLAS_ESCRITO}
+            raise ErrorDeshacer("dependencias", f"Hay filas de otras tablas colgadas {'del movimiento' if movimiento else 'del comprobante'} "
+                                                f"{cid} ({', '.join(colgadas)}): anularlo desde el programa.")
+        borraria = {t: len(escrito[t]) for t in tablas}
         if not confirmar:
             con.rollback()
-            return {"estado": "sin_confirmar", "comprobante_id": cid, "borraria": borraria}
+            return {"estado": "sin_confirmar", clave_id: cid, "borraria": borraria}
 
-        for tabla in reversed(TABLAS_ESCRITO):
+        for tabla in reversed(tablas):
             ids = escrito[tabla]
             if not ids:
                 continue
-            cur.execute(f'DELETE FROM public."{tabla}" WHERE {gc.COLUMNAS[tabla][0]} = ANY(%s)', (ids,))
+            cur.execute(f'DELETE FROM public."{tabla}" WHERE {COLUMNAS_TODAS[tabla][0]} = ANY(%s)', (ids,))
             if cur.rowcount != len(ids):
                 raise AssertionError(f"Se esperaba borrar {len(ids)} filas de {tabla} y se borraron {cur.rowcount}.")
         con.commit()
-        resultado = {"estado": "deshecha", "comprobante_id": cid, "borrado": borraria}
+        resultado = {"estado": "deshecha", clave_id: cid, "borrado": borraria}
         try:
             diario_escribir("deshecha", {"id": carga_id, "clave": None}, nombre_base, escrito=escrito)
         except OSError:
@@ -952,18 +1259,40 @@ def deshacer(cfg: dict[str, str], carga_id, confirmar: bool, base: str | None = 
 # ------------------------------------------------------------------ comandos
 
 def comprobar_estructura(cfg: dict[str, str], base: str | None = None) -> dict:
-    """Prueba de la instalación, solo lectura: estructura y lecturas de referencia con una propuesta vacía."""
+    """Prueba de la instalación, solo lectura: la estructura de las dos recetas (compras y movimientos de fondos) y
+    las lecturas de referencia. Si alguna no coincide, el error dice cuál."""
     con = conectar_garro(cfg, solo_lectura=True, base=base)
     try:
         cur = con.cursor()
-        largos = verificar_estructura(cur)
+        problemas, largos, largos_mov = [], {}, {}
+        try:
+            largos = verificar_estructura(cur)
+        except ErrorEstructura as e:
+            problemas.append(f"Compras: {e}")
+        try:
+            largos_mov = verificar_estructura(cur, gm.COLUMNAS, gm.TIPOS)
+        except ErrorEstructura as e:
+            problemas.append(f"Movimientos de fondos: {e}")
+        if problemas:
+            raise ErrorEstructura(" | ".join(problemas))
         ref = leer_referencias(cur, {}, datetime.now(), cfg, largos)
+        tipos_ok, tipos_con_problema = [], []
+        for tipo_id in gm.TIPOS_HABILITADOS:
+            r = leer_referencias_movimiento(cur, {"tipo_mov_id": tipo_id, "cuenta_bancaria_id": gm.CUENTA_BANCARIA}, datetime.now(), cfg, largos_mov)
+            t = r.tipo
+            bien = t is not None and t.get("es_egreso") is True and t.get("es_ingreso") is False and t.get("genera_asiento") is False
+            (tipos_ok if bien else tipos_con_problema).append(tipo_id)
         con.rollback()
     finally:
         con.close()
     return {"estructura": "OK", "usuario_del_bot": ref.operario_id is not None,
             "configuracion_contable": ref.cuenta_proveedores is not None and ref.cuenta_credito_fiscal is not None,
-            "cuentas": len(ref.cuentas), "categorias": len(ref.categorias), "regimenes": len(ref.regimenes)}
+            "cuentas": len(ref.cuentas), "categorias": len(ref.categorias), "regimenes": len(ref.regimenes),
+            "movimientos_de_fondos": {
+                "tipos_ok": tipos_ok, "tipos_con_problema": tipos_con_problema,
+                "caja": r.caja is not None and r.caja.get("habilitada") is True,
+                "cuenta_bancaria": r.cuenta_bancaria is not None and r.cuenta_bancaria.get("activa") is True
+                and r.cuenta_bancaria.get("plan") == gm.PLAN_CUENTA_BANCARIO}}
 
 
 def _cargar_archivo(ruta: str) -> dict:
@@ -982,7 +1311,7 @@ def _id_de_carga(texto: str):
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="Carga de compras en Gestión Integral (apagada por defecto)")
+    ap = argparse.ArgumentParser(description="Carga de compras y movimientos de fondos en Gestión Integral (apagada por defecto)")
     grupo = ap.add_mutually_exclusive_group(required=True)
     grupo.add_argument("--pasada", action="store_true", help="procesa la cola de cargas (lo que hace la tarea)")
     grupo.add_argument("--archivo", metavar="CARGA.JSON", help="planifica esa carga contra Garro en solo lectura")

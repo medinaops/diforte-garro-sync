@@ -1,0 +1,1411 @@
+{
+ "descripcion": "Casos dorados de duplicados de movimientos de fondos. Cada caso trae `hoy`, la propuesta, los candidatos que hay en Garro y el resultado esperado (ya_cargado | posible | nada). Los usa test_garro_movimientos.py y se corren contra compras_asistente_movimientos_parecidos (mig 666) con su «hoy» fijado en la fecha del caso.",
+ "casos": [
+  {
+   "nombre": "período «periodo 10/2026»",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 50,
+    "descripcion": "COM E IND PER 10/2026",
+    "periodo": "2026-10",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 50,
+     "descripcion": "periodo 10/2026",
+     "fecha": "2026-11-20",
+     "importe": 100
+    }
+   ],
+   "esperado": "ya_cargado"
+  },
+  {
+   "nombre": "período «TASA 10-26»",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 50,
+    "descripcion": "COM E IND PER 10/2026",
+    "periodo": "2026-10",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 50,
+     "descripcion": "TASA 10-26",
+     "fecha": "2026-11-20",
+     "importe": 100
+    }
+   ],
+   "esperado": "ya_cargado"
+  },
+  {
+   "nombre": "período «TASA 10.2026»",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 50,
+    "descripcion": "COM E IND PER 10/2026",
+    "periodo": "2026-10",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 50,
+     "descripcion": "TASA 10.2026",
+     "fecha": "2026-11-20",
+     "importe": 100
+    }
+   ],
+   "esperado": "ya_cargado"
+  },
+  {
+   "nombre": "período «TASA 2026/10»",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 50,
+    "descripcion": "COM E IND PER 10/2026",
+    "periodo": "2026-10",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 50,
+     "descripcion": "TASA 2026/10",
+     "fecha": "2026-11-20",
+     "importe": 100
+    }
+   ],
+   "esperado": "ya_cargado"
+  },
+  {
+   "nombre": "período «TASA 2026-10»",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 50,
+    "descripcion": "COM E IND PER 10/2026",
+    "periodo": "2026-10",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 50,
+     "descripcion": "TASA 2026-10",
+     "fecha": "2026-11-20",
+     "importe": 100
+    }
+   ],
+   "esperado": "ya_cargado"
+  },
+  {
+   "nombre": "período «TASA 10 / 2026»",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 50,
+    "descripcion": "COM E IND PER 10/2026",
+    "periodo": "2026-10",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 50,
+     "descripcion": "TASA 10 / 2026",
+     "fecha": "2026-11-20",
+     "importe": 100
+    }
+   ],
+   "esperado": "ya_cargado"
+  },
+  {
+   "nombre": "período «TASA 10/26»",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 50,
+    "descripcion": "COM E IND PER 10/2026",
+    "periodo": "2026-10",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 50,
+     "descripcion": "TASA 10/26",
+     "fecha": "2026-11-20",
+     "importe": 100
+    }
+   ],
+   "esperado": "ya_cargado"
+  },
+  {
+   "nombre": "no es período «TASA 10 2026»",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 50,
+    "descripcion": "COM E IND PER 10/2026",
+    "periodo": "2026-10",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 50,
+     "descripcion": "TASA 10 2026",
+     "fecha": "2026-11-20",
+     "importe": 100
+    }
+   ],
+   "esperado": "nada"
+  },
+  {
+   "nombre": "no es período «TASA 102026»",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 50,
+    "descripcion": "COM E IND PER 10/2026",
+    "periodo": "2026-10",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 50,
+     "descripcion": "TASA 102026",
+     "fecha": "2026-11-20",
+     "importe": 100
+    }
+   ],
+   "esperado": "nada"
+  },
+  {
+   "nombre": "no es período «TASA 10»",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 50,
+    "descripcion": "COM E IND PER 10/2026",
+    "periodo": "2026-10",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 50,
+     "descripcion": "TASA 10",
+     "fecha": "2026-11-20",
+     "importe": 100
+    }
+   ],
+   "esperado": "nada"
+  },
+  {
+   "nombre": "mes en letras «OCTUBRE 2026»",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 50,
+    "descripcion": "COM E IND PER 10/2026",
+    "periodo": "2026-10",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 50,
+     "descripcion": "OCTUBRE 2026",
+     "fecha": "2026-11-20",
+     "importe": 100
+    }
+   ],
+   "esperado": "ya_cargado"
+  },
+  {
+   "nombre": "mes en letras «OCT/26»",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 50,
+    "descripcion": "COM E IND PER 10/2026",
+    "periodo": "2026-10",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 50,
+     "descripcion": "OCT/26",
+     "fecha": "2026-11-20",
+     "importe": 100
+    }
+   ],
+   "esperado": "ya_cargado"
+  },
+  {
+   "nombre": "mes en letras «oct 2026»",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 50,
+    "descripcion": "COM E IND PER 10/2026",
+    "periodo": "2026-10",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 50,
+     "descripcion": "oct 2026",
+     "fecha": "2026-11-20",
+     "importe": 100
+    }
+   ],
+   "esperado": "ya_cargado"
+  },
+  {
+   "nombre": "mes en letras «Octubre-2026»",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 50,
+    "descripcion": "COM E IND PER 10/2026",
+    "periodo": "2026-10",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 50,
+     "descripcion": "Octubre-2026",
+     "fecha": "2026-11-20",
+     "importe": 100
+    }
+   ],
+   "esperado": "ya_cargado"
+  },
+  {
+   "nombre": "mes en letras «OCT. 26»",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 50,
+    "descripcion": "COM E IND PER 10/2026",
+    "periodo": "2026-10",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 50,
+     "descripcion": "OCT. 26",
+     "fecha": "2026-11-20",
+     "importe": 100
+    }
+   ],
+   "esperado": "ya_cargado"
+  },
+  {
+   "nombre": "mes en letras otro año",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 50,
+    "descripcion": "COM E IND PER 10/2026",
+    "periodo": "2026-10",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 50,
+     "descripcion": "OCTUBRE 2025",
+     "fecha": "2026-11-20",
+     "importe": 100
+    }
+   ],
+   "esperado": "nada"
+  },
+  {
+   "nombre": "mes en letras otro mes",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 50,
+    "descripcion": "COM E IND PER 10/2026",
+    "periodo": "2026-10",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 50,
+     "descripcion": "NOVIEMBRE 2026",
+     "fecha": "2026-11-20",
+     "importe": 100
+    }
+   ],
+   "esperado": "nada"
+  },
+  {
+   "nombre": "octubres no es octubre",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 50,
+    "descripcion": "COM E IND PER 10/2026",
+    "periodo": "2026-10",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 50,
+     "descripcion": "OCTUBRES 2026",
+     "fecha": "2026-11-20",
+     "importe": 100
+    }
+   ],
+   "esperado": "nada"
+  },
+  {
+   "nombre": "octubre solo, dentro de la ventana",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 50,
+    "descripcion": "COM E IND PER 10/2026",
+    "periodo": "2026-10",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 50,
+     "descripcion": "PAGO octubre",
+     "fecha": "2026-11-10",
+     "importe": 100
+    }
+   ],
+   "esperado": "ya_cargado"
+  },
+  {
+   "nombre": "octubre solo, antes del período",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 50,
+    "descripcion": "COM E IND PER 10/2026",
+    "periodo": "2026-10",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 50,
+     "descripcion": "PAGO octubre",
+     "fecha": "2025-10-15",
+     "importe": 100
+    }
+   ],
+   "esperado": "nada"
+  },
+  {
+   "nombre": "octubre seguido de número no vale",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 50,
+    "descripcion": "COM E IND PER 10/2026",
+    "periodo": "2026-10",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 50,
+     "descripcion": "PAGO octubre 15",
+     "fecha": "2026-11-10",
+     "importe": 100
+    }
+   ],
+   "esperado": "nada"
+  },
+  {
+   "nombre": "PER 10 sin año, dentro de la ventana",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 50,
+    "descripcion": "COM E IND PER 10/2026",
+    "periodo": "2026-10",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 50,
+     "descripcion": "COM E IND PER 10",
+     "fecha": "2026-11-05",
+     "importe": 100
+    }
+   ],
+   "esperado": "ya_cargado"
+  },
+  {
+   "nombre": "PER 10 de hace un año no bloquea",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 50,
+    "descripcion": "COM E IND PER 10/2026",
+    "periodo": "2026-10",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 50,
+     "descripcion": "COM E IND PER 10",
+     "fecha": "2025-10-20",
+     "importe": 100
+    }
+   ],
+   "esperado": "nada"
+  },
+  {
+   "nombre": "PER 10 al borde de la ventana (4 meses después, excluido)",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 50,
+    "descripcion": "COM E IND PER 10/2026",
+    "periodo": "2026-10",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 50,
+     "descripcion": "COM E IND PER 10",
+     "fecha": "2027-02-01",
+     "importe": 100
+    }
+   ],
+   "esperado": "nada"
+  },
+  {
+   "nombre": "PER 10 a 4 meses menos un día",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 50,
+    "descripcion": "COM E IND PER 10/2026",
+    "periodo": "2026-10",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 50,
+     "descripcion": "COM E IND PER 10",
+     "fecha": "2027-01-31",
+     "importe": 100
+    }
+   ],
+   "esperado": "ya_cargado"
+  },
+  {
+   "nombre": "PER 10 un día antes del período",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 50,
+    "descripcion": "COM E IND PER 10/2026",
+    "periodo": "2026-10",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 50,
+     "descripcion": "COM E IND PER 10",
+     "fecha": "2026-09-30",
+     "importe": 100
+    }
+   ],
+   "esperado": "nada"
+  },
+  {
+   "nombre": "periodo 10 con punto",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 50,
+    "descripcion": "COM E IND PER 10/2026",
+    "periodo": "2026-10",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 50,
+     "descripcion": "periodo. 10",
+     "fecha": "2026-11-05",
+     "importe": 100
+    }
+   ],
+   "esperado": "ya_cargado"
+  },
+  {
+   "nombre": "PER 100 no es el 10",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 50,
+    "descripcion": "COM E IND PER 10/2026",
+    "periodo": "2026-10",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 50,
+     "descripcion": "COM E IND PER 100",
+     "fecha": "2026-11-05",
+     "importe": 100
+    }
+   ],
+   "esperado": "nada"
+  },
+  {
+   "nombre": "otro período",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 50,
+    "descripcion": "COM E IND PER 10/2026",
+    "periodo": "2026-10",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 50,
+     "descripcion": "COM E IND PER 09/2026",
+     "fecha": "2026-11-05",
+     "importe": 100
+    }
+   ],
+   "esperado": "nada"
+  },
+  {
+   "nombre": "otro período 11",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 50,
+    "descripcion": "COM E IND PER 10/2026",
+    "periodo": "2026-10",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 50,
+     "descripcion": "COM E IND PER 11/2026",
+     "fecha": "2026-11-05",
+     "importe": 100
+    }
+   ],
+   "esperado": "nada"
+  },
+  {
+   "nombre": "fecha completa dd/mm/aaaa",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 50,
+    "descripcion": "COM E IND PER 10/2026",
+    "periodo": "2026-10",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 50,
+     "descripcion": "PAGO 05/10/2026",
+     "fecha": "2026-11-20",
+     "importe": 100
+    }
+   ],
+   "esperado": "nada"
+  },
+  {
+   "nombre": "fecha completa dd-mm-aa",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 50,
+    "descripcion": "COM E IND PER 10/2026",
+    "periodo": "2026-10",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 50,
+     "descripcion": "VEP 5-10-26",
+     "fecha": "2026-11-20",
+     "importe": 100
+    }
+   ],
+   "esperado": "nada"
+  },
+  {
+   "nombre": "fecha completa aaaa/mm/dd",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 50,
+    "descripcion": "COM E IND PER 10/2026",
+    "periodo": "2026-10",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 50,
+     "descripcion": "PAGO 2026/10/05",
+     "fecha": "2026-11-20",
+     "importe": 100
+    }
+   ],
+   "esperado": "nada"
+  },
+  {
+   "nombre": "fecha completa con punto",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 50,
+    "descripcion": "COM E IND PER 10/2026",
+    "periodo": "2026-10",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 50,
+     "descripcion": "PAGO 05.10.2026",
+     "fecha": "2026-11-20",
+     "importe": 100
+    }
+   ],
+   "esperado": "nada"
+  },
+  {
+   "nombre": "período de otro tipo no cuenta",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 50,
+    "descripcion": "COM E IND PER 10/2026",
+    "periodo": "2026-10",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 17,
+     "descripcion": "COM E IND PER 10/2026",
+     "fecha": "2026-11-20",
+     "importe": 100
+    }
+   ],
+   "esperado": "nada"
+  },
+  {
+   "nombre": "período con otros caracteres alrededor",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 50,
+    "descripcion": "COM E IND PER 10/2026",
+    "periodo": "2026-10",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 50,
+     "descripcion": "(10/2026)",
+     "fecha": "2026-11-20",
+     "importe": 100
+    }
+   ],
+   "esperado": "ya_cargado"
+  },
+  {
+   "nombre": "mes sin cero",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 50,
+    "descripcion": "COM E IND PER 10/2026",
+    "periodo": "2026-10",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 50,
+     "descripcion": "TASA 1/26",
+     "fecha": "2026-11-20",
+     "importe": 100
+    }
+   ],
+   "esperado": "nada"
+  },
+  {
+   "nombre": "período de un dígito",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 50,
+    "descripcion": "TASA",
+    "periodo": "2026-01",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 50,
+     "descripcion": "TASA 1/2026",
+     "fecha": "2026-02-01",
+     "importe": 100
+    }
+   ],
+   "esperado": "ya_cargado"
+  },
+  {
+   "nombre": "período de un dígito con cero",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 50,
+    "descripcion": "TASA",
+    "periodo": "2026-01",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 50,
+     "descripcion": "TASA 01-26",
+     "fecha": "2026-02-01",
+     "importe": 100
+    }
+   ],
+   "esperado": "ya_cargado"
+  },
+  {
+   "nombre": "septiembre con set",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 50,
+    "descripcion": "TASA",
+    "periodo": "2026-09",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 50,
+     "descripcion": "TASA SET/26",
+     "fecha": "2026-11-01",
+     "importe": 100
+    }
+   ],
+   "esperado": "ya_cargado"
+  },
+  {
+   "nombre": "septiembre con sept",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 50,
+    "descripcion": "TASA",
+    "periodo": "2026-09",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 50,
+     "descripcion": "TASA SEPT 2026",
+     "fecha": "2026-11-01",
+     "importe": 100
+    }
+   ],
+   "esperado": "ya_cargado"
+  },
+  {
+   "nombre": "tipo 17 solo con el período",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 17,
+    "descripcion": "CARGAS SOCIALES PER 10/2026",
+    "periodo": "2026-10",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 17,
+     "descripcion": "F931 10/2026",
+     "fecha": "2026-11-05",
+     "importe": 100
+    }
+   ],
+   "esperado": "ya_cargado"
+  },
+  {
+   "nombre": "otra sigla, mismo período: posible",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 58,
+    "descripcion": "INACAP PER 10/2026",
+    "periodo": "2026-10",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 58,
+     "descripcion": "FAECYS PER 10/2026",
+     "fecha": "2026-11-05",
+     "importe": 100
+    }
+   ],
+   "esperado": "posible"
+  },
+  {
+   "nombre": "misma sigla: ya cargado",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 58,
+    "descripcion": "FAECYS PER 10/2026",
+    "periodo": "2026-10",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 58,
+     "descripcion": "FAECYS PER 10/2026",
+     "fecha": "2026-11-05",
+     "importe": 100
+    }
+   ],
+   "esperado": "ya_cargado"
+  },
+  {
+   "nombre": "misma sigla sin PER en lo pedido",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 58,
+    "descripcion": "FAECYS 10/2026 TRANSFERENCIA",
+    "periodo": "2026-10",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 58,
+     "descripcion": "FAECYS PER 10/2026",
+     "fecha": "2026-11-05",
+     "importe": 100
+    }
+   ],
+   "esperado": "ya_cargado"
+  },
+  {
+   "nombre": "la sigla es una palabra entera",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 58,
+    "descripcion": "FAECYS PER 10/2026",
+    "periodo": "2026-10",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 58,
+     "descripcion": "FAECYSX PER 10/2026",
+     "fecha": "2026-11-05",
+     "importe": 100
+    }
+   ],
+   "esperado": "posible"
+  },
+  {
+   "nombre": "la sigla aparece dentro del candidato",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 58,
+    "descripcion": "FAECYS PER 10/2026",
+    "periodo": "2026-10",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 58,
+     "descripcion": "APORTES FAECYS PER 10/2026",
+     "fecha": "2026-11-05",
+     "importe": 100
+    }
+   ],
+   "esperado": "ya_cargado"
+  },
+  {
+   "nombre": "sin sigla en lo pedido",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 58,
+    "descripcion": "PER 10/2026",
+    "periodo": "2026-10",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 58,
+     "descripcion": "FAECYS PER 10/2026",
+     "fecha": "2026-11-05",
+     "importe": 100
+    }
+   ],
+   "esperado": "posible"
+  },
+  {
+   "nombre": "sigla con acentos",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 58,
+    "descripcion": "SINDICATO CORDOBA PER 10/2026",
+    "periodo": "2026-10",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 58,
+     "descripcion": "SINDICATO CÓRDOBA PER 10/2026",
+     "fecha": "2026-11-05",
+     "importe": 100
+    }
+   ],
+   "esperado": "ya_cargado"
+  },
+  {
+   "nombre": "AFIP: otro impuesto, mismo período",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 13,
+    "descripcion": "GANANCIAS PER 10/2026",
+    "periodo": "2026-10",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 13,
+     "descripcion": "IVA PER 10/2026",
+     "fecha": "2026-11-05",
+     "importe": 100
+    }
+   ],
+   "esperado": "posible"
+  },
+  {
+   "nombre": "AFIP: mismo impuesto",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 13,
+    "descripcion": "IVA PER 10/2026",
+    "periodo": "2026-10",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 13,
+     "descripcion": "IVA PER 10/2026",
+     "fecha": "2026-11-05",
+     "importe": 100
+    }
+   ],
+   "esperado": "ya_cargado"
+  },
+  {
+   "nombre": "el exacto gana al posible",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 58,
+    "descripcion": "FAECYS PER 10/2026",
+    "periodo": "2026-10",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 58,
+     "descripcion": "INACAP PER 10/2026",
+     "fecha": "2026-11-05",
+     "importe": 100
+    },
+    {
+     "tipo": 58,
+     "descripcion": "FAECYS PER 10/2026",
+     "fecha": "2026-11-06",
+     "importe": 100
+    }
+   ],
+   "esperado": "ya_cargado"
+  },
+  {
+   "nombre": "sin candidatos",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 58,
+    "descripcion": "FAECYS PER 10/2026",
+    "periodo": "2026-10",
+    "importe": 5000
+   },
+   "candidatos": [],
+   "esperado": "nada"
+  },
+  {
+   "nombre": "mismo tipo e importe, hace 30 días",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 50,
+    "descripcion": "COBRO SIN PERIODO",
+    "periodo": "2026-10",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 50,
+     "descripcion": "OTRO TEXTO",
+     "fecha": "2026-10-27",
+     "importe": 5000.5,
+     "egreso": true
+    }
+   ],
+   "esperado": "posible"
+  },
+  {
+   "nombre": "mismo tipo, importe a $1 justo",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 50,
+    "descripcion": "COBRO SIN PERIODO",
+    "periodo": "2026-10",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 50,
+     "descripcion": "OTRO TEXTO",
+     "fecha": "2026-10-27",
+     "importe": 5001,
+     "egreso": true
+    }
+   ],
+   "esperado": "posible"
+  },
+  {
+   "nombre": "mismo tipo, importe a más de $1",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 50,
+    "descripcion": "COBRO SIN PERIODO",
+    "periodo": "2026-10",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 50,
+     "descripcion": "OTRO TEXTO",
+     "fecha": "2026-10-27",
+     "importe": 5001.01,
+     "egreso": true
+    }
+   ],
+   "esperado": "nada"
+  },
+  {
+   "nombre": "mismo tipo dentro de la ventana del período (hace más de 40 días)",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 50,
+    "descripcion": "COBRO SIN PERIODO",
+    "periodo": "2026-09",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 50,
+     "descripcion": "OTRO TEXTO",
+     "fecha": "2026-10-16",
+     "importe": 5000,
+     "egreso": true
+    }
+   ],
+   "esperado": "posible"
+  },
+  {
+   "nombre": "mismo tipo fuera de 40 días y antes del período",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 50,
+    "descripcion": "COBRO SIN PERIODO",
+    "periodo": "2026-10",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 50,
+     "descripcion": "OTRO TEXTO",
+     "fecha": "2026-09-30",
+     "importe": 5000,
+     "egreso": true
+    }
+   ],
+   "esperado": "nada"
+  },
+  {
+   "nombre": "mismo tipo a 40 días de hoy",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 50,
+    "descripcion": "COBRO SIN PERIODO",
+    "periodo": "2026-03",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 50,
+     "descripcion": "OTRO TEXTO",
+     "fecha": "2027-01-05",
+     "importe": 5000,
+     "egreso": true
+    }
+   ],
+   "esperado": "posible"
+  },
+  {
+   "nombre": "mismo tipo a 41 días de hoy",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 50,
+    "descripcion": "COBRO SIN PERIODO",
+    "periodo": "2026-03",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 50,
+     "descripcion": "OTRO TEXTO",
+     "fecha": "2027-01-06",
+     "importe": 5000,
+     "egreso": true
+    }
+   ],
+   "esperado": "nada"
+  },
+  {
+   "nombre": "mismo tipo, justo hace 40 días",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 50,
+    "descripcion": "COBRO SIN PERIODO",
+    "periodo": "2026-03",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 50,
+     "descripcion": "OTRO TEXTO",
+     "fecha": "2026-10-17",
+     "importe": 5000,
+     "egreso": true
+    }
+   ],
+   "esperado": "posible"
+  },
+  {
+   "nombre": "mismo tipo, hace 41 días",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 50,
+    "descripcion": "COBRO SIN PERIODO",
+    "periodo": "2026-03",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 50,
+     "descripcion": "OTRO TEXTO",
+     "fecha": "2026-10-16",
+     "importe": 5000,
+     "egreso": true
+    }
+   ],
+   "esperado": "nada"
+  },
+  {
+   "nombre": "el último día de la ventana del período (4 meses después, inclusive)",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 50,
+    "descripcion": "COBRO SIN PERIODO",
+    "periodo": "2026-01",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 50,
+     "descripcion": "OTRO TEXTO",
+     "fecha": "2026-05-01",
+     "importe": 5000,
+     "egreso": true
+    }
+   ],
+   "esperado": "posible"
+  },
+  {
+   "nombre": "pasada la ventana del período",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 50,
+    "descripcion": "COBRO SIN PERIODO",
+    "periodo": "2026-01",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 50,
+     "descripcion": "OTRO TEXTO",
+     "fecha": "2026-05-02",
+     "importe": 5000,
+     "egreso": true
+    }
+   ],
+   "esperado": "nada"
+  },
+  {
+   "nombre": "otro tipo, egreso, hace 10 días",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 50,
+    "descripcion": "COBRO SIN PERIODO",
+    "periodo": "2026-10",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 73,
+     "descripcion": "OTRO TEXTO",
+     "fecha": "2026-11-16",
+     "importe": 5000,
+     "egreso": true
+    }
+   ],
+   "esperado": "posible"
+  },
+  {
+   "nombre": "otro tipo, egreso, en 10 días",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 50,
+    "descripcion": "COBRO SIN PERIODO",
+    "periodo": "2026-10",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 73,
+     "descripcion": "OTRO TEXTO",
+     "fecha": "2026-12-06",
+     "importe": 5000,
+     "egreso": true
+    }
+   ],
+   "esperado": "posible"
+  },
+  {
+   "nombre": "otro tipo, egreso, hace 11 días",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 50,
+    "descripcion": "COBRO SIN PERIODO",
+    "periodo": "2026-10",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 73,
+     "descripcion": "OTRO TEXTO",
+     "fecha": "2026-11-15",
+     "importe": 5000,
+     "egreso": true
+    }
+   ],
+   "esperado": "nada"
+  },
+  {
+   "nombre": "otro tipo que no es egreso",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 50,
+    "descripcion": "COBRO SIN PERIODO",
+    "periodo": "2026-10",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 73,
+     "descripcion": "OTRO TEXTO",
+     "fecha": "2026-11-16",
+     "importe": 5000,
+     "egreso": false
+    }
+   ],
+   "esperado": "nada"
+  },
+  {
+   "nombre": "otro tipo con la descripción del período no cuenta como período",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 50,
+    "descripcion": "COBRO SIN PERIODO",
+    "periodo": "2026-10",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 73,
+     "descripcion": "F931 10/2026",
+     "fecha": "2026-11-16",
+     "importe": 5001,
+     "egreso": true
+    }
+   ],
+   "esperado": "posible"
+  },
+  {
+   "nombre": "importe menor a $1000 no avisa por importe",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 50,
+    "descripcion": "COBRO SIN PERIODO",
+    "periodo": "2026-10",
+    "importe": 999.5
+   },
+   "candidatos": [
+    {
+     "tipo": 50,
+     "descripcion": "OTRO TEXTO",
+     "fecha": "2026-11-20",
+     "importe": 999,
+     "egreso": true
+    }
+   ],
+   "esperado": "nada"
+  },
+  {
+   "nombre": "importe de exactamente $1000",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 50,
+    "descripcion": "COBRO SIN PERIODO",
+    "periodo": "2026-10",
+    "importe": 1000
+   },
+   "candidatos": [
+    {
+     "tipo": 50,
+     "descripcion": "OTRO TEXTO",
+     "fecha": "2026-11-20",
+     "importe": 1000,
+     "egreso": true
+    }
+   ],
+   "esperado": "posible"
+  },
+  {
+   "nombre": "el candidato no tiene importe",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 50,
+    "descripcion": "COBRO SIN PERIODO",
+    "periodo": "2026-10",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 50,
+     "descripcion": "OTRO TEXTO",
+     "fecha": "2026-11-20",
+     "importe": null,
+     "egreso": true
+    }
+   ],
+   "esperado": "nada"
+  },
+  {
+   "nombre": "candidato sin importe y sin medios de otro tipo",
+   "hoy": "2026-11-26",
+   "propuesta": {
+    "tipo": 50,
+    "descripcion": "COBRO SIN PERIODO",
+    "periodo": "2026-10",
+    "importe": 5000
+   },
+   "candidatos": [
+    {
+     "tipo": 73,
+     "descripcion": "OTRO TEXTO",
+     "fecha": "2026-11-20",
+     "importe": null,
+     "egreso": true
+    }
+   ],
+   "esperado": "nada"
+  }
+ ]
+}

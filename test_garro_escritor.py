@@ -13,13 +13,16 @@ import sys
 import tempfile
 import types
 import unittest
-from datetime import date
+from datetime import date, datetime
+from decimal import Decimal
 from unittest import mock
 
 import garro_cargas as gc
 import garro_escritor as ge
+import garro_movimientos as gm
 import garro_sync as g
 from test_garro_cargas import AHORA, carga_base, ref_base
+from test_garro_movimientos import AHORA as AHORA_MOV, propuesta as propuesta_mov, ref_base as ref_mov, transferencia as transf_mov
 
 
 class CursorFalso:
@@ -484,6 +487,518 @@ class AsientoEnCentavos(unittest.TestCase):
             movs = plan.asiento["movimientos"]
             self.assertEqual(sum(ge._centavos(m["imp_asiento_contable_movimiento"]) for m in movs if m["es_debe"]),
                              ge._centavos(movs[0]["imp_asiento_contable_movimiento"]))
+
+
+# ------------------------------------------------------------------ movimientos de fondos
+
+class CursorGuion:
+    """Cursor que contesta según un guion (texto que aparece en la consulta -> filas). Una consulta que el guion
+    no prevé hace fallar el test."""
+
+    def __init__(self, guion):
+        self.guion, self.consultas, self.filas = guion, [], []
+
+    def execute(self, sql, params=None):
+        self.consultas.append((sql, params))
+        for clave, filas in self.guion:
+            if clave in sql:
+                self.filas = filas
+                return
+        raise AssertionError(f"consulta no prevista: {sql[:90]}")
+
+    def fetchone(self):
+        return self.filas[0] if self.filas else None
+
+    def fetchall(self):
+        return list(self.filas)
+
+
+def filas_del_plan(plan, mid=700, medio=55, vinculo=33):
+    """Las filas completas (en el orden de las columnas de la receta) que Garro devolvería si lo escrito es lo del plan."""
+    t_medio, t_vinculo = gm.TABLAS_EFECTIVO if plan.medio == "efectivo" else gm.TABLAS_BANCO
+    clave = "fk_id_efectivo_medio_de_pago" if plan.medio == "efectivo" else "fk_id_movimiento_cuenta_bancaria"
+    dicts = {
+        "movimientos_fondos": {"id_movimiento_fondo": mid, **plan.movimiento},
+        t_medio: {gm.COLUMNAS[t_medio][0]: medio, **plan.medio_fila},
+        t_vinculo: {gm.COLUMNAS[t_vinculo][0]: vinculo, "fk_id_movimiento_fondo": mid, clave: medio, **plan.vinculo},
+    }
+    return {t: [tuple(d[c] for c in gm.COLUMNAS[t])] for t, d in dicts.items()}
+
+
+def guion_movimiento(plan, mid=700, medio=55, vinculo=33, filas=None, **cambios):
+    """Lo que devolvería Garro si lo escrito coincide con el plan; `filas` pisa las filas de una tabla y `cambios`, una consulta."""
+    efectivo = plan.medio == "efectivo"
+    f = {**filas_del_plan(plan, mid, medio, vinculo), **(filas or {})}
+    guion = {
+        "SELECT id_movimiento_fondo FROM movimientos_fondos": [(mid,)],
+        "SELECT id_efectivo_medio_de_pago_en_movimiento_fondo, fk_id_efectivo_medio_de_pago": [(vinculo, medio)] if efectivo else [],
+        "SELECT id_movimiento_cuenta_bancaria_en_movimiento_fondo, fk_id_movimiento_cuenta_bancaria": [] if efectivo else [(vinculo, medio)],
+        "FROM asientos_contables": [(0,)],
+    }
+    guion.update({f'FROM public."{t}" WHERE': rows for t, rows in f.items()})
+    guion.update(cambios)
+    return list(guion.items())
+
+
+def escrito_mov(medio="efectivo", mid=700, medio_id=55, vinculo=33):
+    e = {t: [] for t in gm.TABLAS_ESCRITO}
+    e["movimientos_fondos"] = [mid]
+    t_medio, t_vinculo = gm.TABLAS_EFECTIVO if medio == "efectivo" else gm.TABLAS_BANCO
+    e[t_medio], e[t_vinculo] = [medio_id], [vinculo]
+    e["clase"] = "movimiento_fondo"
+    return e
+
+
+def distinto(valor):
+    if isinstance(valor, bool):
+        return not valor
+    if isinstance(valor, (int, float)):
+        return valor + 0.01 if isinstance(valor, float) else valor + 1
+    if isinstance(valor, datetime):
+        return valor.replace(year=valor.year + 1)
+    if isinstance(valor, date):
+        return date(valor.year + 1, 1, 1)
+    return "x" if valor is None else str(valor) + "x"
+
+
+class VerificarMovimiento(unittest.TestCase):
+    def plan(self, medio="efectivo"):
+        return gm.planificar(propuesta_mov() if medio == "efectivo" else transf_mov(), ref_mov(), AHORA_MOV)
+
+    def falla(self, plan, escrito, **kw):
+        with self.assertRaises(AssertionError):
+            ge.verificar_movimiento(CursorGuion(guion_movimiento(plan, **kw)), plan, escrito)
+
+    def test_lo_que_coincide_con_el_plan_pasa_en_efectivo_y_en_transferencia(self):
+        for medio in ("efectivo", "transferencia"):
+            plan = self.plan(medio)
+            ge.verificar_movimiento(CursorGuion(guion_movimiento(plan)), plan, escrito_mov(medio))
+
+    def test_cualquier_columna_de_cualquier_fila_distinta_se_detecta(self):
+        for medio in ("efectivo", "transferencia"):
+            plan = self.plan(medio)
+            for tabla, filas in filas_del_plan(plan).items():
+                for k, columna in enumerate(gm.COLUMNAS[tabla]):
+                    fila = list(filas[0])
+                    fila[k] = distinto(fila[k])
+                    with self.assertRaises(AssertionError, msg=f"{tabla}.{columna}") as cm:
+                        ge.verificar_movimiento(CursorGuion(guion_movimiento(plan, filas={tabla: [tuple(fila)]})), plan, escrito_mov(medio))
+                    if k:
+                        self.assertIn(columna, str(cm.exception))
+
+    def test_un_centavo_de_diferencia_en_el_importe(self):
+        for medio, tabla, columna in (("efectivo", "efectivo_medio_de_pago", "imp_efectivo_medio_de_pago"),
+                                      ("transferencia", "movimientos_cuentas_bancarias", "imp_movimiento_cuenta_bancaria")):
+            plan = self.plan(medio)
+            for delta in (Decimal("0.01"), Decimal("-0.01"), Decimal("1000")):
+                fila = list(filas_del_plan(plan)[tabla][0])
+                k = gm.COLUMNAS[tabla].index(columna)
+                fila[k] = Decimal(str(fila[k])) + delta
+                self.falla(plan, escrito_mov(medio), filas={tabla: [tuple(fila)]})
+
+    def test_un_importe_que_difiere_menos_de_un_centavo_no_es_un_error(self):
+        plan = self.plan()
+        fila = list(filas_del_plan(plan)["efectivo_medio_de_pago"][0])
+        k = gm.COLUMNAS["efectivo_medio_de_pago"].index("imp_efectivo_medio_de_pago")
+        fila[k] = fila[k] + 0.0000001
+        ge.verificar_movimiento(CursorGuion(guion_movimiento(plan, filas={"efectivo_medio_de_pago": [tuple(fila)]})), plan, escrito_mov())
+
+    def test_la_fila_no_esta_o_hay_mas_de_una(self):
+        plan = self.plan()
+        self.falla(plan, escrito_mov(), filas={"movimientos_fondos": []})
+        self.falla(plan, escrito_mov(), filas={"movimientos_fondos": filas_del_plan(plan)["movimientos_fondos"] * 2})
+
+    def test_lo_que_cuelga_no_es_lo_escrito(self):
+        plan = self.plan()
+        self.falla(plan, escrito_mov(), **{"SELECT id_movimiento_fondo FROM movimientos_fondos": []})
+        self.falla(plan, escrito_mov(vinculo=34))
+        self.falla(plan, escrito_mov(medio_id=56))
+        self.falla(plan, escrito_mov(), **{"SELECT id_efectivo_medio_de_pago_en_movimiento_fondo, fk_id_efectivo_medio_de_pago": [(33, 55), (34, 56)]})
+        self.falla(plan, escrito_mov(), **{"SELECT id_movimiento_cuenta_bancaria_en_movimiento_fondo, fk_id_movimiento_cuenta_bancaria": [(40, 900)]})
+
+    def test_si_el_plan_era_transferencia_y_quedo_efectivo(self):
+        plan = self.plan("transferencia")
+        self.falla(plan, escrito_mov("transferencia"), **{
+            "SELECT id_efectivo_medio_de_pago_en_movimiento_fondo, fk_id_efectivo_medio_de_pago": [(33, 55)]})
+
+    def test_si_el_plan_era_efectivo_y_quedo_banco(self):
+        self.falla(self.plan(), escrito_mov(), **{
+            "SELECT id_movimiento_cuenta_bancaria_en_movimiento_fondo, fk_id_movimiento_cuenta_bancaria": [(33, 55)]})
+
+    def test_un_asiento_colgado_es_un_error(self):
+        self.falla(self.plan(), escrito_mov(), **{"FROM asientos_contables": [(1,)]})
+
+    def test_el_asiento_se_busca_por_el_movimiento_y_por_el_movimiento_bancario(self):
+        plan = self.plan("transferencia")
+        cur = CursorGuion(guion_movimiento(plan))
+        ge.verificar_movimiento(cur, plan, escrito_mov("transferencia"))
+        sql, params = [c for c in cur.consultas if "asientos_contables" in c[0]][0]
+        self.assertIn("fk_id_movimiento_fondo", sql)
+        self.assertIn("fk_id_movimiento_cuenta_bancaria", sql)
+        self.assertEqual(params, (700, [55]))
+
+
+class NormalizarEscritoMovimiento(unittest.TestCase):
+    def test_efectivo_y_banco_validos(self):
+        for medio in ("efectivo", "transferencia"):
+            r = ge._normalizar_escrito({**escrito_mov(medio), "huella": "h"})
+            self.assertEqual((r["clase"], r["huella"], r["movimientos_fondos"]), ("movimiento_fondo", "h", [700]))
+
+    def test_lo_escrito_sin_clase_es_de_compras(self):
+        e = {t: [] for t in ge.TABLAS_ESCRITO}
+        e["comprobantes_compras"] = [5]
+        e["huella"] = "h"
+        self.assertEqual(ge._normalizar_escrito(e)["clase"], "compra")
+
+    def test_registros_invalidos(self):
+        casos = []
+        base = {**escrito_mov(), "huella": "h"}
+        casos.append({**base, "clase": "otra"})
+        casos.append({k: v for k, v in base.items() if k != "huella"})
+        casos.append({**base, "huella": ""})
+        casos.append({**base, "movimientos_fondos": []})
+        casos.append({**base, "movimientos_fondos": [700, 701]})
+        casos.append({**base, "efectivo_medio_de_pago": []})                                     # medio sin vínculo
+        casos.append({**base, "movimientos_cuentas_bancarias": [9], "movimientos_cuenta_bancaria_en_movimientos_fondos": [9]})  # los dos medios
+        casos.append({**{k: ([] if isinstance(v, list) else v) for k, v in base.items()}, "movimientos_fondos": [700]})  # sin medio
+        casos.append({**base, "movimientos_fondos": [True]})
+        casos.append({**base, "efectivo_medio_de_pago": ["55"]})
+        casos.append({**base, "efectivo_medio_de_pago": 55})
+        for e in casos:
+            with self.assertRaises(ge.ErrorDeshacer) as cm:
+                ge._normalizar_escrito(e)
+            self.assertEqual(cm.exception.codigo, "escrito_invalido")
+
+
+class FlujoDeMovimiento(Base):
+    CFG = {"GARRO_BASE": "real"}
+
+    def carga(self, p=None, **kw):
+        return {"id": 21, "clave": "m1", "modo": "real", "retomada": False,
+                "payload": {"propuesta": p if p is not None else propuesta_mov()}, **kw}
+
+    def correr(self, en_seco, *, carga=None, ref=None, verificar=None, commit=None, extra=()):
+        con = mock.MagicMock()
+        if commit is not None:
+            con.commit.side_effect = commit
+        escrito = {**escrito_mov(), "huella": None}
+        parches = [
+            mock.patch.object(ge, "conectar_garro", return_value=con),
+            mock.patch.object(ge, "verificar_estructura", return_value={}),
+            mock.patch.object(ge, "leer_referencias_movimiento", return_value=ref or ref_mov()),
+            mock.patch.object(ge, "leer_referencias"),
+            mock.patch.object(ge, "escribir_movimiento", return_value=escrito),
+            mock.patch.object(ge, "verificar_movimiento", side_effect=verificar),
+            mock.patch.object(ge, "huella", return_value="h"),
+            mock.patch.object(ge, "escribir"),
+            *extra,
+        ]
+        mocks = [p.start() for p in parches]
+        self.addCleanup(lambda: [p.stop() for p in reversed(parches)])
+        r = ge.cargar_una(self.CFG, carga or self.carga(), en_seco=en_seco, ahora=AHORA_MOV)
+        return r, con, dict(zip(("conectar", "estructura", "refs_mov", "refs_compra", "escribir_mov", "verificar", "huella", "escribir"), mocks))
+
+    def test_en_seco_solo_lee_y_devuelve_el_plan(self):
+        r, con, m = self.correr(True)
+        self.assertEqual(r["estado"], "simulada")
+        self.assertEqual((r["plan"]["clase"], r["plan"]["medio"], r["plan"]["asiento"]), ("movimiento_fondo", "efectivo", False))
+        m["escribir_mov"].assert_not_called()
+        con.commit.assert_not_called()
+        con.rollback.assert_called()
+        self.assertEqual(m["conectar"].call_args.kwargs["solo_lectura"], True)
+        self.assertNotIn("LOCK", " ".join(c.args[0] for c in con.cursor.return_value.execute.call_args_list))
+        self.assertFalse(os.path.exists(ge.DIARIO))
+
+    def test_real_usa_la_receta_y_el_lock_de_movimientos_y_no_toca_la_de_compras(self):
+        r, con, m = self.correr(False)
+        self.assertEqual((r["estado"], r["clase"], r["movimiento_id"]), ("cargada", "movimiento_fondo", 700))
+        self.assertEqual(r["escrito"]["huella"], "h")
+        m["estructura"].assert_called_once()
+        self.assertEqual(m["estructura"].call_args.args[1:], (gm.COLUMNAS, gm.TIPOS))
+        m["refs_compra"].assert_not_called()
+        m["escribir"].assert_not_called()
+        sentencias = [c.args[0] for c in con.cursor.return_value.execute.call_args_list]
+        self.assertEqual(sentencias, [ge.LOCK_TABLAS_MOVIMIENTO])
+        self.assertNotIn("comprobantes_compras", ge.LOCK_TABLAS_MOVIMIENTO)
+        con.commit.assert_called_once()
+        eventos = [json.loads(l)["evento"] for l in open(ge.DIARIO, encoding="utf-8")]
+        self.assertEqual(eventos, ["intento", "cargada"])
+
+    def test_un_rechazo_del_planificador_no_escribe_ni_confirma(self):
+        for cambio, codigo in (({"importe": 0}, "importe"), ({"tipo_mov_id": 62}, "tipo_no_habilitado"),
+                               ({"requiere_revision": True}, "requiere_revision")):
+            r, con, m = self.correr(False, carga=self.carga(propuesta_mov(**cambio)))
+            self.assertEqual((r["estado"], r["codigo"]), ("rechazada", codigo))
+            m["escribir_mov"].assert_not_called()
+            con.commit.assert_not_called()
+            con.rollback.assert_called()
+
+    def test_un_duplicado_leido_en_la_transaccion_no_escribe(self):
+        ref = ref_mov(existentes=[{"id": 8, "tipo": 50, "descripcion": "periodo 10/2026", "fecha": datetime(2026, 11, 26), "importe": 1.0, "egreso": True}])
+        r, con, m = self.correr(False, ref=ref)
+        self.assertEqual((r["estado"], r["codigo"]), ("rechazada", "ya_cargado"))
+        m["escribir_mov"].assert_not_called()
+        con.commit.assert_not_called()
+
+    def test_si_la_verificacion_falla_hace_rollback_y_no_confirma(self):
+        r, con, m = self.correr(False, verificar=AssertionError("el importe no coincide"))
+        self.assertEqual((r["estado"], r["codigo"]), ("error", "excepcion"))
+        con.commit.assert_not_called()
+        con.rollback.assert_called()
+
+    def test_un_commit_que_falla_es_incierto_y_no_se_resuelve(self):
+        r, con, m = self.correr(False, commit=RuntimeError("se cortó"))
+        self.assertEqual((r["estado"], r["codigo"]), ("indeterminado", "commit_incierto"))
+
+    def test_garro_ocupado_vuelve_a_la_cola_y_no_escribe(self):
+        r, con, m = self.correr(False, extra=[mock.patch.object(ge, "leer_referencias_movimiento", side_effect=ErrE("lock", "55P03"))])
+        self.assertEqual((r["estado"], r["codigo"]), ("pendiente", "ocupado"))
+        m["escribir_mov"].assert_not_called()
+
+    def test_la_estructura_de_movimientos_rota_rechaza_el_movimiento_pero_no_las_compras(self):
+        def estructura(cur, columnas=None, tipos=None):
+            if columnas is gm.COLUMNAS:
+                raise ge.ErrorEstructura("cambió movimientos_fondos")
+            return {}
+        r, con, m = self.correr(False, extra=[mock.patch.object(ge, "verificar_estructura", side_effect=estructura)])
+        self.assertEqual((r["estado"], r["codigo"]), ("error", "estructura"))
+        m["escribir_mov"].assert_not_called()
+        # la misma estructura rota no frena una compra
+        with mock.patch.object(ge, "conectar_garro", return_value=mock.MagicMock()), \
+                mock.patch.object(ge, "verificar_estructura", side_effect=estructura), \
+                mock.patch.object(ge, "leer_referencias", return_value=ref_base()):
+            r = ge.cargar_una(self.CFG, {"id": 5, "modo": "en_seco", "payload": carga_base()}, en_seco=True, ahora=AHORA)
+        self.assertEqual(r["estado"], "simulada")
+
+    def test_la_estructura_de_compras_rota_no_frena_los_movimientos(self):
+        def estructura(cur, columnas=None, tipos=None):
+            if columnas is None:
+                raise ge.ErrorEstructura("cambió comprobantes_compras")
+            return {}
+        r, con, m = self.correr(True, extra=[mock.patch.object(ge, "verificar_estructura", side_effect=estructura)])
+        self.assertEqual(r["estado"], "simulada")
+
+    def test_clase_desconocida_o_que_no_coincide_se_rechaza_sin_conectar(self):
+        for p, cola in (({"clase": "pago"}, None), ({"clase": "compra"}, "movimiento_fondo"), (propuesta_mov(), "compra"),
+                        ({"clase": ["compra"]}, None), ({"clase": 1}, None), ({}, "pago")):
+            with mock.patch.object(ge, "conectar_garro") as conectar:
+                carga = {"id": 1, "modo": "real", "payload": {"propuesta": p}}
+                if cola:
+                    carga["clase"] = cola
+                r = ge.cargar_una(self.CFG, carga, en_seco=False)
+            self.assertEqual((r["estado"], r.get("codigo")), ("rechazada", "clase"), (p, cola))
+            conectar.assert_not_called()
+
+    def test_la_clase_puede_venir_de_la_cola_o_de_la_propuesta(self):
+        p = propuesta_mov()
+        del p["clase"]
+        r, con, m = self.correr(True, carga=self.carga(p, clase="movimiento_fondo"))
+        self.assertEqual(r["plan"]["clase"], "movimiento_fondo")
+        r, con, m = self.correr(True, carga=self.carga(propuesta_mov(), clase="movimiento_fondo"))
+        self.assertEqual(r["estado"], "simulada")
+
+    def test_sin_clase_en_ningun_lado_es_una_compra(self):
+        with mock.patch.object(ge, "conectar_garro", return_value=mock.MagicMock()), \
+                mock.patch.object(ge, "verificar_estructura", return_value={}), \
+                mock.patch.object(ge, "leer_referencias", return_value=ref_base()), \
+                mock.patch.object(ge, "leer_referencias_movimiento") as leer_mov:
+            r = ge.cargar_una(self.CFG, {"id": 5, "modo": "en_seco", "payload": carga_base()}, en_seco=True, ahora=AHORA)
+        self.assertEqual(r["estado"], "simulada")
+        leer_mov.assert_not_called()
+
+
+class RetomadaDeMovimiento(Base):
+    CARGA = {"id": 8, "clave": "m", "modo": "real", "retomada": True, "payload": {"propuesta": propuesta_mov()}}
+    CFG = {"GARRO_BASE": "b"}
+
+    def con_intento(self, carga_id=8, base="b"):
+        ge.diario_escribir("intento", {"id": carga_id, "clave": "m"}, base, total=1.0)
+
+    def retomar(self, busqueda=None, **kw):
+        with mock.patch.object(ge, "_buscar_movimiento_propio", busqueda or mock.MagicMock(return_value=(None, True))) as buscar, \
+                mock.patch.object(ge, "_buscar_lo_propio") as de_compras, \
+                mock.patch.object(ge, "conectar_garro", side_effect=RuntimeError("no llega")) as conectar:
+            r = ge.cargar_una(self.CFG, {**self.CARGA, **kw}, en_seco=False)
+        return r, buscar, de_compras, conectar
+
+    def test_con_intento_y_encontrada_no_toca_las_guardas_ni_la_receta_de_compras(self):
+        self.con_intento()
+        r, buscar, de_compras, conectar = self.retomar(mock.MagicMock(return_value=(77, True)))
+        buscar.assert_called_once()
+        de_compras.assert_not_called()
+        self.assertEqual((r["estado"], r["movimiento_id"], r["recuperada"], r["clase"]), ("cargada", 77, True, "movimiento_fondo"))
+        self.assertNotIn("comprobante_id", r)
+        conectar.assert_not_called()
+
+    def test_sin_intento_de_esta_carga_no_se_toma_nada_por_propio(self):
+        # Ni el intento de otra carga, ni el de otra base: esta carga nunca empezó a escribir, se planifica como nueva.
+        self.con_intento(carga_id=9)
+        self.con_intento(base="otra")
+        r, buscar, _, conectar = self.retomar(mock.MagicMock(return_value=(77, True)))
+        buscar.assert_not_called()
+        conectar.assert_called()
+        self.assertEqual(r["estado"], "indeterminado")      # la retomada con un error no resuelve
+
+    def test_inconclusa_o_fallida_es_indeterminada(self):
+        self.con_intento()
+        for busqueda in (mock.MagicMock(side_effect=RuntimeError("sin red")), mock.MagicMock(return_value=(None, False))):
+            r, _, _, conectar = self.retomar(busqueda)
+            self.assertEqual(r["estado"], "indeterminado")
+            conectar.assert_not_called()
+
+    def test_un_intento_sin_resultado_y_sin_nada_en_el_programa_no_se_replanifica(self):
+        self.con_intento()
+        r, _, _, conectar = self.retomar()
+        self.assertEqual((r["estado"], r["codigo"]), ("indeterminado", "intento_sin_resultado"))
+        conectar.assert_not_called()
+
+    def test_escrita_en_el_diario_y_ya_no_esta_no_se_reescribe(self):
+        self.con_intento()
+        ge.diario_escribir("cargada", {"id": 8, "clave": "m"}, "b", escrito=escrito_mov())
+        r, _, _, conectar = self.retomar()
+        self.assertEqual((r["estado"], r["codigo"]), ("indeterminado", "escrita_y_ya_no_esta"))
+        conectar.assert_not_called()
+
+    def test_deshecha_y_ya_no_esta_se_planifica_de_nuevo(self):
+        self.con_intento()
+        ge.diario_escribir("cargada", {"id": 8, "clave": "m"}, "b", escrito=escrito_mov())
+        ge.diario_escribir("deshecha", {"id": 8, "clave": "m"}, "b", escrito=escrito_mov())
+        r, _, _, conectar = self.retomar()
+        conectar.assert_called()
+
+    def test_una_retomada_de_una_carga_en_seco_no_busca(self):
+        self.con_intento()
+        r, buscar, _, _ = self.retomar(modo="en_seco")
+        buscar.assert_not_called()
+
+    def test_buscar_lo_propio_por_operario_tipo_descripcion_fecha_e_importe(self):
+        def buscar(filas, operarios=((77,),), p=None):
+            cur = CursorGuion([("FROM operarios", list(operarios)), ("FROM movimientos_fondos", list(filas))])
+            con = mock.MagicMock()
+            con.cursor.return_value = cur
+            with mock.patch.object(ge, "conectar_garro", return_value=con):
+                return ge._buscar_movimiento_propio({}, p or propuesta_mov(descripcion="  com e ind per 10/2026 ", importe=123456.78, fecha="2026-11-24"), None), cur
+        (res, cur) = buscar([(700,)])
+        self.assertEqual(res, (700, True))
+        sql, params = [c for c in cur.consultas if "FROM movimientos_fondos" in c[0]][0]
+        self.assertEqual(params, (77, 50, "COM E IND PER 10/2026", date(2026, 11, 24), 12345678))
+        self.assertIn("des_movimiento_fondo = %s", sql)
+        self.assertIn("fec_movimiento_fondo::date = %s", sql)
+        self.assertIn("* 100) = %s", sql)
+        self.assertEqual(buscar([])[0], (None, True))
+        self.assertEqual(buscar([(700,), (701,)])[0], (None, False))
+        self.assertEqual(buscar([(700,)], operarios=())[0], (None, False))
+        self.assertEqual(buscar([(700,)], operarios=((1,), (2,)))[0], (None, False))
+        for malo in (propuesta_mov(descripcion=""), propuesta_mov(descripcion=None), propuesta_mov(tipo_mov_id="x"),
+                     propuesta_mov(importe=0), propuesta_mov(importe="5"), propuesta_mov(fecha="mañana"), propuesta_mov(fecha=None)):
+            with mock.patch.object(ge, "conectar_garro") as conectar:
+                self.assertEqual(ge._buscar_movimiento_propio({}, malo, None), (None, False))
+            conectar.assert_not_called()
+
+
+class ColaDeMovimientos(Base):
+    def test_toma_las_dos_clases(self):
+        with mock.patch.object(ge, "_destino", return_value={"id": 1}) as destino:
+            self.assertEqual(ge.cola_tomar({}), {"id": 1})
+        self.assertEqual(destino.call_args.args[1], "SELECT garro.cargas_tomar(ARRAY['compra','movimiento_fondo'])")
+
+    def test_sin_la_funcion_nueva_las_compras_siguen_con_la_vieja(self):
+        llamadas = []
+
+        def destino(cfg, sql, params=()):
+            llamadas.append(sql)
+            if "ARRAY" in sql:
+                raise ge.ColaSinFunciones()
+            return {"id": 3}
+        with mock.patch.object(ge, "_destino", side_effect=destino):
+            self.assertEqual(ge.cola_tomar({}), {"id": 3})
+        self.assertEqual(llamadas, ["SELECT garro.cargas_tomar(ARRAY['compra','movimiento_fondo'])", "SELECT garro.cargas_tomar()"])
+        with mock.patch.object(ge, "_destino", side_effect=ge.ColaSinFunciones()):
+            with self.assertRaises(ge.ColaSinFunciones):
+                ge.cola_tomar({})
+        with mock.patch.object(ge, "_destino", side_effect=RuntimeError("sin red")):
+            with self.assertRaises(RuntimeError):
+                ge.cola_tomar({})
+
+    def test_una_clase_que_el_servidor_no_conoce_nunca_llega_a_escribir(self):
+        # Una cola vieja o con una clase nueva puede devolver cualquier cosa: se rechaza, no se escribe.
+        cola = [{"id": 1, "modo": "real", "clase": "pago", "payload": {"propuesta": {}}}]
+        res = mock.MagicMock()
+        with mock.patch.object(ge, "cola_tomar", side_effect=lambda c: cola.pop(0) if cola else None), \
+                mock.patch.object(ge, "conectar_garro") as conectar, mock.patch.object(ge, "cola_resolver", res):
+            ge.pasada({"CARGAS": "1", "CARGAS_REAL": "1"})
+        conectar.assert_not_called()
+        self.assertEqual(res.call_args.args[2], "rechazada")
+
+
+class EstructuraPorReceta(Base):
+    def filas(self, columnas, tipos):
+        return [(t, c, None, tipos[t].get(c, "integer")) for t, cols in columnas.items() for c in cols]
+
+    def cursor(self, filas):
+        class Cur(CursorFalso):
+            def __init__(self):
+                super().__init__()
+                self.resultado = []
+
+            def execute(self, sql, params=None):
+                self.resultado = filas if "information_schema" in sql else []
+
+            def fetchall(self):
+                return self.resultado
+        return Cur()
+
+    def test_cada_receta_mira_solo_sus_tablas(self):
+        mov = self.filas(gm.COLUMNAS, gm.TIPOS)
+        comp = self.filas(gc.COLUMNAS, gc.TIPOS)
+        # las tablas de compras no existen: la receta de movimientos no se entera
+        largos = ge.verificar_estructura(self.cursor(mov), gm.COLUMNAS, gm.TIPOS)
+        self.assertEqual(len(largos), sum(len(c) for c in gm.COLUMNAS.values()))
+        # y al revés
+        ge.verificar_estructura(self.cursor(comp))
+
+    def test_movimientos_con_columna_de_mas_de_menos_o_de_otro_tipo(self):
+        mov = self.filas(gm.COLUMNAS, gm.TIPOS)
+        casos = (
+            (mov + [("movimientos_fondos", "nueva", None, "integer")], "movimientos_fondos: columnas de más nueva"),
+            ([f for f in mov if f[1] != "centro_costos"], "faltan columnas centro_costos"),
+            ([(t, c, l, "text" if c == "des_movimiento_fondo" else d) for t, c, l, d in mov],
+             "movimientos_fondos.des_movimiento_fondo: es text y se esperaba character varying"),
+            ([f for f in mov if f[0] != "efectivo_medio_de_pago"], "efectivo_medio_de_pago: la tabla no existe"),
+        )
+        for filas, texto in casos:
+            with self.assertRaises(ge.ErrorEstructura) as cm:
+                ge.verificar_estructura(self.cursor(filas), gm.COLUMNAS, gm.TIPOS)
+            self.assertIn(texto, str(cm.exception))
+
+    def test_un_trigger_en_una_tabla_de_movimientos_frena(self):
+        mov = self.filas(gm.COLUMNAS, gm.TIPOS)
+
+        class Cur(CursorFalso):
+            def __init__(self):
+                super().__init__()
+                self.resultado = []
+
+            def execute(self, sql, params=None):
+                self.resultado = mov if "information_schema" in sql else ([("movimientos_fondos", "trg_x")] if "pg_trigger" in sql else [])
+
+            def fetchall(self):
+                return self.resultado
+        with self.assertRaises(ge.ErrorEstructura) as cm:
+            ge.verificar_estructura(Cur(), gm.COLUMNAS, gm.TIPOS)
+        self.assertIn("movimientos_fondos: tiene un trigger (trg_x)", str(cm.exception))
+
+
+class InsertarMovimientos(Base):
+    def test_las_tablas_de_movimientos_se_insertan_con_su_receta(self):
+        cur = CursorFalso()
+        ge._insertar(cur, "efectivo_medio_de_pago_en_movimientos_fondos", {"fk_id_caja": 1},
+                     fk_id_movimiento_fondo=3, fk_id_efectivo_medio_de_pago=4)
+        sql, params = cur.sentencias[0]
+        self.assertIn("RETURNING id_efectivo_medio_de_pago_en_movimiento_fondo", sql)
+        self.assertEqual(params, [3, 4, 1])
+        with self.assertRaises(ge.ErrorPlan):
+            ge._insertar(cur, "efectivo_medio_de_pago_en_movimientos_fondos", {"fk_id_caja": 1}, fk_id_movimiento_fondo=3)
 
 
 if __name__ == "__main__":

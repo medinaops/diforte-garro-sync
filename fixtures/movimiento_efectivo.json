@@ -1,0 +1,19 @@
+{
+  "propuesta": {
+    "clase": "movimiento_fondo",
+    "tipo_mov_id": 50,
+    "tipo_mov_nombre": "COMERCIO INDUSTRIA Y SERVICIO MUNICIPAL",
+    "descripcion": "COM E IND PER 09/2026",
+    "periodo": "2026-09",
+    "importe": 123456.78,
+    "medio": "efectivo",
+    "caja": 1,
+    "cuenta_bancaria_id": null,
+    "fecha": "2026-11-24",
+    "vencimiento": "2026-10-20",
+    "organismo": "ORGANISMO DE EJEMPLO",
+    "requiere_revision": false,
+    "posible_duplicado": null
+  },
+  "total_pesos": 123456.78
+}

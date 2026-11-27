@@ -1,0 +1,19 @@
+{
+  "propuesta": {
+    "clase": "movimiento_fondo",
+    "tipo_mov_id": 58,
+    "tipo_mov_nombre": "SINDICATO",
+    "descripcion": "FAECYS PER 09/2026",
+    "periodo": "2026-09",
+    "importe": 45678.9,
+    "medio": "transferencia",
+    "caja": 1,
+    "cuenta_bancaria_id": 11,
+    "fecha": "2026-11-24",
+    "vencimiento": "2026-10-20",
+    "organismo": "ORGANISMO DE EJEMPLO",
+    "requiere_revision": false,
+    "posible_duplicado": null
+  },
+  "total_pesos": 45678.9
+}

@@ -45,7 +45,7 @@ $ProgressPreference = "SilentlyContinue"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # ---------------------------------------------------------------- constantes
-$Version         = "v1.8.0"
+$Version         = "v1.9.0"
 $Repo            = "medinaops/diforte-garro-sync"
 # Por usuario: en C:\ cualquier usuario puede crear carpetas y plantar un python.exe; en LOCALAPPDATA no.
 $Dir             = Join-Path $env:LOCALAPPDATA "Diforte\garro-sync"
@@ -59,9 +59,11 @@ $PythonSha256    = "0eb85c2dfccccf1b17352de4c397f69194035b7d37149eacc16f1147d93d
 # BEGIN HASHES
 $HashesPaquete = @{
     "actualizar-ahora.bat" = "82b5fc5df5775d5d6680c085c5b5f417cc5f7658be8ecc8a3b9029218776e177"
+    "comparar_movimientos.py" = "3de754be993c11a7e670bdf8094943e785368890a7e7c4a85e45ad5e1f16b65a"
     "garro_cargas.py" = "bbc775b5e834a39900bc21ff60360b4280c8c82cfcc824c4339b4295819f73ce"
     "garro_copia.py" = "1934854cb2ef5d51408e5c3041dfbbdbb185228116010f2b5157926f48111918"
-    "garro_escritor.py" = "723a3e40f46f7c92712a9d27af8ae2349b815ce676e047288c2c230207941b46"
+    "garro_escritor.py" = "12eb4498da7764f0cb1418e5a6b3fd4951904e0ddf9215a95caea9cff61c697c"
+    "garro_movimientos.py" = "55a202fef5a0d24d5a84c0dea3aa15ab6ab5cebb52f5281c75ad18316e21ff9d"
     "garro_sync.py" = "b8e462274f9638d38139606a8e70b9a444a46790693700fabd9d3f8b37ed31dd"
     "relevar_compras.py" = "ee9eb74799f97ce01be1a794add4da18836dc5b233d9314ba8e2c66d1e656056"
     "requirements.txt" = "b3e919e8eac4bfae6f8d92ab116ee3fef65ce487bc818cbcbb38228be74e3703"
